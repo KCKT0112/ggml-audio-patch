@@ -117,3 +117,118 @@ out[k, q, b] = Σ_c x[c, q_h·W+q_w, b] · W[r_h(q_h−k_h+H−1), c]
 ## 上游跟进建议
 
 四个算子都适合作为独立小 patch 向 ggml main 提交讨论：`REL_POS_BIAS` 与 `SCATTER_ELEMENTS` 上游至今空缺；`IM2COL_FAST_1D` 建议附性能数据提交；`conv_transpose_1d_ext` 更适合作为 `GGML_OP_CONV_TRANSPOSE_1D` 的**参数扩展**提案而非新 op。
+
+---
+
+# 补丁二：十个 qvac 融合算子
+
+**来源**：[tetherto/qvac-ext-ggml](https://github.com/tetherto/qvac-ext-ggml) 的 `speech` 分支（MIT）。上游为让三个音频引擎跑成"少分发"计算图而加：**Supertonic** 声码器（ConvNeXt 风格块）、**LavaSR** 降噪器、**ACE-Step Oobleck VAE**。十个都不是包装——每个都把"逐节点调度开销占主导"的多算子子图压成单次遍历（实测见 [benchmarks_zh.md](benchmarks_zh.md)）。
+
+**共同设计**：全部 F32-only（与上游 CPU 实现对齐）、要求连续输入、layout/参数放 `op_params`。五个 supertonic 算子都有 layout-0（`[T,C]`，T 在内）与 layout-1（`_ct`，`[C,T]`，C 在内）两个变体，共享同一内核、靠 stride 翻转区分；`depthwise_1d` 另有 `_causal_ct` 变体（causal 左填充，K ∈ {3,5,7}）。
+
+## 5. `GGML_OP_SUPERTONIC_DEPTHWISE_1D`
+
+```
+y[t,c] = bias[c] + Σ_k w[k,c] · x[clamp(t + (k + k_off)·dil, 0, L-1), c]
+k_off = causal ? -(K-1) : -K/2
+```
+
+把 `pad → im2col → mul_mat → bias`（4 节点 + F16 scratch 张量）压成对 `[L, C]` 的一次遍历。权重布局沿用 ggml 约定 `[K, 1, C]`。CPU 内核按通道分条（bias/w 每通道只载一次）。**CPU 实测比组合 `conv_1d_dw` 链快 19–30×**，主要来自消灭 F16 im2col 物化。
+
+## 6. `GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL`
+
+```
+y[t,c] = (x[t,c] − mean_t) / sqrt(var_t + eps) · g[c] + b[c]
+```
+
+原版 `ggml_norm` 只沿 `ne[0]` 归一化，通道轴归一化需要 permute/cont/norm/mul/add/permute/cont 七节点链。单内核完成（mean/var 双精度累加）。CPU 在宽行形状上最高 2.6×；超大 `C` 时 CPU 链的布局反而更快——这正是融合内核在 GPU 端（省 command buffer 条数）价值最大的原因。
+
+## 7. `GGML_OP_SUPERTONIC_PW2_RESIDUAL`
+
+```
+y[t,c] = residual[t,c] + (x[t,c] + bias[c]) · gamma[c]
+```
+
+三个逐元素算子 → 一个。CPU 3.9–6.8×。
+
+## 8. `GGML_OP_SUPERTONIC_BIAS_GELU`
+
+```
+y[t,c] = 0.5·v·(1 + erf(v/√2)),  v = x[t,c] + bias[c]
+```
+
+运算次序与 `ggml_gelu_erf` 逐位一致。CPU 1.7–3.2×。
+
+## 9. `GGML_OP_SUPERTONIC_EDGE_PAD_1D`
+
+```
+y[t,c] = x[clamp(t − pad_left, 0, L_in − 1), c]
+```
+
+复制/边缘钳位 padding（声码器 causal 只填左侧，编码器对称双侧）。替代 view/repeat/concat 链。CPU 12.8–13.5×。
+
+## 10. `GGML_OP_GRU`
+
+融合分批 GRU，一次算完 L 个时间步，PyTorch 语义：门序 r/z/n，reset 作用于 hh（循环）新门，`h0 = 0`。
+
+```
+whh [H, 3H]     循环权重（列 g = whh[.., g]）
+gi  [3H, B, L]  输入投影（W_ih·x + b_ih 在图里预先算好，不进本算子）
+bhh [3H]        循环偏置
+dst [H, B, L]
+每步：gh = whhᵀh + bhh；r = σ(gi_r + gh_r)；z = σ(gi_z + gh_z)；
+      n = tanh(gi_n + r·gh_n)；h = n + z·(h − n)
+```
+
+`reverse` 翻转时间方向（BiGRU = 调两次）。此前 ggml 核心**没有任何 RNN 单元**——本算子补上空缺（对 RMVPE 式 BiGRU 后滤波等场景直接可用）。CPU：按 batch 并行、按时间串行、朴素内积。Vulkan：`gru.comp` 每 128-lane workgroup 打包 `128/H` 个 batch 元素（共享内存上限 H ≤ 128），另有 H = 2/4/8 的寄存器驻留 `gru_small.comp` 变体（时间循环零 barrier）。
+
+**实测**：CPU H512×B4×L32 ≈ 47 ms；Vulkan（RTX 2070）H64×B1×L256 ≈ 2.2 ms。
+
+## 11. `GGML_OP_ZERO_UPSAMPLE`
+
+```
+out[i0·s, ...] = a[i0, ...]，其余为零；out.ne0 = (a.ne0 − 1)·s + 1
+```
+
+零插入上采样——LavaSR 解码器用的转置卷积对偶。替代 `upscale + 掩码乘` 或零填充 convT 技巧。CPU 最高 15×，Vulkan ~1.3×（该规模下受发射次数限制）。
+
+## 12. `GGML_OP_CHANNEL_SHUFFLE`
+
+PyTorch 通道混洗（沿 `ne[2]`）：`in_c = (c' % G)·(C/G) + c'/G`。每输出通道一次平面拷贝，替代 reshape+permute+cont（三节点，其中两个是拷贝）。CPU ~1.5×；Vulkan 上 view 链本就是一次融合拷贝，收益主要是省发射次数。
+
+## 13. `GGML_OP_AFFINE_PRELU`
+
+```
+out = x·aw[f,c] + ab[f,c] + max(x,0) + slope[c]·min(x,0)
+```
+
+`[F,T,C,Bc]` 频谱形状激活的逐通道仿射 + PReLU（LavaSR 降噪器）。CPU 1.6–2.1×，Vulkan 3.4–6.3×（组合链需要两次 `repeat` 广播 + 四个逐元素内核）。
+
+## 14. `GGML_OP_SNAKE`
+
+```
+y = x + sin²(a·x) · inv_b        (a、inv_b 逐通道)
+```
+
+ACE-Step Oobleck VAE 的 snake 激活。Vulkan 端本移植**直接复用上游 `snake_f32` pipeline**——基线 v0.19 树里本就有图级 snake 融合（`mul→sin→sqr→mul→add` 模式识别），数学与 binding 布局完全一致，op 路径直接走它（2D `ne0×ne1` 网格，`{ne0, ne1}` push constants）。CPU 2.2–4.6×，Vulkan 最高 3.9×。
+
+## 补丁二后端支持矩阵
+
+| 算子 | CPU | Vulkan | CUDA | Metal |
+|---|---|---|---|---|
+| `SUPERTONIC_DEPTHWISE_1D`（含 `_ct` / `_causal_ct`） | ✅ | —（回落 CPU） | — | — |
+| `SUPERTONIC_LAYER_NORM_CHANNEL`（含 `_ct`） | ✅ | — | — | — |
+| `SUPERTONIC_PW2_RESIDUAL`（含 `_ct`） | ✅ | — | — | — |
+| `SUPERTONIC_BIAS_GELU`（含 `_ct`） | ✅ | — | — | — |
+| `SUPERTONIC_EDGE_PAD_1D`（含 `_ct`） | ✅ | — | — | — |
+| `GRU` | ✅ | ✅ H ≤ 128（含 H=2/4/8 变体） | — | — |
+| `ZERO_UPSAMPLE` | ✅ | ✅ | — | — |
+| `CHANNEL_SHUFFLE` | ✅ | ✅ | — | — |
+| `AFFINE_PRELU` | ✅ | ✅ | — | — |
+| `SNAKE` | ✅ | ✅ | — | — |
+
+上游 qvac 中 supertonic 五件套是 Metal 内核（`kernel_supertonic_*_f32`）、后五件是 Vulkan shader；本移植保留 Vulkan 五件套，Metal/CUDA 全部先关闭（干净回落 CPU），Metal 内核留作移植参考。
+
+## 补丁二上游跟进建议
+
+`GRU` 是最强的上游候选（RNN 空缺、语义干净、自包含）；`ZERO_UPSAMPLE` + `CHANNEL_SHUFFLE` + `AFFINE_PRELU` + `SNAKE` 可打包成"音频激活/重排"小集合；supertonic 五件套建议等有第二个后端（Metal 或 CUDA）能撑起 API 面积后再作融合算子提案。

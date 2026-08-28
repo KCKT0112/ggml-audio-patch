@@ -118,3 +118,118 @@ I.e. the row/column key-query displacement each indexes one weight row, dot-prod
 ## Upstream follow-up suggestions
 
 All four operators are suitable as standalone discussion patches against ggml main: `REL_POS_BIAS` and `SCATTER_ELEMENTS` remain absent upstream; `IM2COL_FAST_1D` should be submitted with the attached measurements; `conv_transpose_1d_ext` fits better as a **parameter-extension proposal** for `GGML_OP_CONV_TRANSPOSE_1D` than as a new op.
+
+---
+
+# Patch 2 — the ten qvac fused operators
+
+**Origin**: [tetherto/qvac-ext-ggml](https://github.com/tetherto/qvac-ext-ggml), branch `speech` (MIT). These ten ops were added upstream to make three audio engines run as single-dispatch graphs: the **Supertonic** vocoder (ConvNeXt-style blocks), the **LavaSR** denoiser, and the **ACE-Step Oobleck VAE**. None of them are thin wrappers — each replaces a multi-op sub-graph whose per-node scheduling overhead dominates (see [benchmarks.md](benchmarks.md)).
+
+**Shared design**: all ops are F32-only (CPU bring-up parity with upstream), contiguous-input, and carry layout/parameter flags in `op_params`. The five supertonic ops come in layout-0 (`[T,C]`, T inner) and layout-1 (`_ct`, `[C,T]`, C inner) variants sharing one kernel via stride flips; `depthwise_1d` additionally has a `_causal_ct` variant (causal-left padding, K ∈ {3,5,7}).
+
+## 5. `GGML_OP_SUPERTONIC_DEPTHWISE_1D`
+
+```
+y[t,c] = bias[c] + Σ_k w[k,c] · x[clamp(t + (k + k_off)·dil, 0, L-1), c]
+k_off = causal ? -(K-1) : -K/2
+```
+
+Replaces `pad → im2col → mul_mat → bias-add` (4 nodes + an F16 scratch tensor) with one pass over `[L, C]`. Weight layout matches ggml conv convention `[K, 1, C]`. CPU kernel stripes over channels (bias/w row loaded once per channel). **Measured 19–30× faster on CPU** than the composed `conv_1d_dw` chain, mostly by eliminating the F16 im2col materialization.
+
+## 6. `GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL`
+
+```
+y[t,c] = (x[t,c] − mean_t) / sqrt(var_t + eps) · g[c] + b[c]
+```
+
+Stock `ggml_norm` normalizes along `ne[0]` only, so channel-axis norm requires permute/cont/norm/mul/add/permute/cont. One kernel does the whole thing (double-precision mean/var accumulation). CPU up to 2.6× vs the chain on wide-row shapes; on very large `C` the CPU chain's BLAS-friendly layout wins, which is why the fused kernel also matters most on GPU command-buffer counts.
+
+## 7. `GGML_OP_SUPERTONIC_PW2_RESIDUAL`
+
+```
+y[t,c] = residual[t,c] + (x[t,c] + bias[c]) · gamma[c]
+```
+
+Three elementwise ops → one. CPU 3.9–6.8×. Trivially parallel over channels.
+
+## 8. `GGML_OP_SUPERTONIC_BIAS_GELU`
+
+```
+y[t,c] = 0.5·v·(1 + erf(v/√2)),  v = x[t,c] + bias[c]
+```
+
+Matches `ggml_gelu_erf` bit-for-bit in op order. CPU 1.7–3.2×.
+
+## 9. `GGML_OP_SUPERTONIC_EDGE_PAD_1D`
+
+```
+y[t,c] = x[clamp(t − pad_left, 0, L_in − 1), c]
+```
+
+Replicate/edge-clamp padding (left-only for causal vocoders, symmetric for encoders). Replaces view/repeat/concat chains. CPU 12.8–13.5×.
+
+## 10. `GGML_OP_GRU`
+
+Fused batched GRU over all L time-steps, PyTorch semantics: gate order r/z/n, reset applied to the hh (recurrent) new-gate, `h0 = 0`.
+
+```
+whh [H, 3H]   recurrent weight (column g = whh[.., g])
+gi  [3H, B, L]  input projection PRE-COMPUTED (W_ih·x + b_ih lives outside the op)
+bhh [3H]      recurrent bias
+dst [H, B, L]
+per step: gh = whhᵀh + bhh; r = σ(gi_r + gh_r); z = σ(gi_z + gh_z);
+          n = tanh(gi_n + r·gh_n); h = n + z·(h − n)
+```
+
+`reverse` flips the time direction (BiGRU = two calls). ggml core previously had **no RNN cell of any kind** — this fills the gap (relevant to RMVPE-style BiGRU post-filters). CPU: parallel over batch, serial over time, naive inner products. Vulkan: `gru.comp` packs `128/H` batch elements per 128-lane workgroup (H ≤ 128 shared-memory cap) plus register-resident `gru_small.comp` variants for H = 2/4/8 with zero barriers in the time loop.
+
+**Measured**: CPU H512×B4×L32 ≈ 47 ms; Vulkan (RTX 2070) H64×B1×L256 ≈ 2.2 ms.
+
+## 11. `GGML_OP_ZERO_UPSAMPLE`
+
+```
+out[i0·s, ...] = a[i0, ...], zeros elsewhere;  out.ne0 = (a.ne0 − 1)·s + 1
+```
+
+Zero-insertion upsampling — the exact transpose-conv counterpart used by LavaSR's decoder. Replaces `upscale + mask-mul` or zero-padded convT tricks. CPU up to 15×, Vulkan ~1.3× (launch-bound at these sizes).
+
+## 12. `GGML_OP_CHANNEL_SHUFFLE`
+
+PyTorch channel shuffle over `ne[2]`: `in_c = (c' % G)·(C/G) + c'/G`. One plane copy per output channel instead of reshape+permute+cont (three nodes, two of them copies). CPU ~1.5×; on Vulkan the view chain is a single fused copy so gains are launch-count only.
+
+## 13. `GGML_OP_AFFINE_PRELU`
+
+```
+out = x·aw[f,c] + ab[f,c] + max(x,0) + slope[c]·min(x,0)
+```
+
+Per-channel affine + PReLU for `[F,T,C,Bc]` spectrogram-shaped activations (LavaSR denoiser). CPU 1.6–2.1×, Vulkan 3.4–6.3× (the composed chain needs two `repeat` broadcasts and four elementwise kernels).
+
+## 14. `GGML_OP_SNAKE`
+
+```
+y = x + sin²(a·x) · inv_b        (a, inv_b per channel)
+```
+
+Snake activation from ACE-Step's Oobleck VAE. On Vulkan this port **reuses the upstream `snake_f32` pipeline** — the base v0.19 tree already ships a graph-level snake fusion (`mul→sin→sqr→mul→add` detection) with identical math and binding layout, so the op-level path simply dispatches through it (2-D `ne0×ne1` grid, `{ne0, ne1}` push constants). CPU 2.2–4.6×, Vulkan up to 3.9×.
+
+## Patch-2 backend support matrix
+
+| Operator | CPU | Vulkan | CUDA | Metal |
+|---|---|---|---|---|
+| `SUPERTONIC_DEPTHWISE_1D` (+`_ct`, `_causal_ct`) | ✅ | — (CPU fallback) | — | — |
+| `SUPERTONIC_LAYER_NORM_CHANNEL` (+`_ct`) | ✅ | — | — | — |
+| `SUPERTONIC_PW2_RESIDUAL` (+`_ct`) | ✅ | — | — | — |
+| `SUPERTONIC_BIAS_GELU` (+`_ct`) | ✅ | — | — | — |
+| `SUPERTONIC_EDGE_PAD_1D` (+`_ct`) | ✅ | — | — | — |
+| `GRU` | ✅ | ✅ H ≤ 128 (+H=2/4/8 variants) | — | — |
+| `ZERO_UPSAMPLE` | ✅ | ✅ | — | — |
+| `CHANNEL_SHUFFLE` | ✅ | ✅ | — | — |
+| `AFFINE_PRELU` | ✅ | ✅ | — | — |
+| `SNAKE` | ✅ | ✅ | — | — |
+
+Upstream qvac implements the supertonic five as Metal kernels (`kernel_supertonic_*_f32`) and the other five as Vulkan shaders; this port keeps the Vulkan five, gates Metal/CUDA off for all ten (clean CPU fallback), and notes the Metal kernels as porting reference.
+
+## Patch-2 upstream follow-up suggestions
+
+`GRU` is the strongest upstream candidate (RNN gap, clean semantics, self-contained). `ZERO_UPSAMPLE` + `CHANNEL_SHUFFLE` + `AFFINE_PRELU` + `SNAKE` are a natural "audio activation/reshape pack". The supertonic five make most sense upstream as a fused-op discussion once a second backend (Metal or CUDA) exists to justify the API surface.

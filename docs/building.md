@@ -14,14 +14,17 @@ Prerequisites, patch application, per-backend build recipes, and known toolchain
 | CUDA toolkit | `GGML_CUDA=ON` | 12.x recommended; see the multi-toolkit pitfall below |
 | Ninja | Windows builds | bundled with Visual Studio's CMake component |
 
-## 1. Apply the patch
+## 1. Apply the patches
 
 ```bash
 git clone https://github.com/ggml-org/ggml.git ggml-src
 cd ggml-src
 git checkout 30bf868                       # v0.19.0
-git apply <path-to>/patches/learned-ops-ggml0190.patch
+git apply <path-to>/patches/learned-ops-ggml0190.patch   # patch 1 (required)
+git apply <path-to>/patches/qvac-ops-ggml0190.patch      # patch 2 (optional, sequential)
 ```
+
+Patch 2 must be applied **after** patch 1 (they touch the same enum-assert and dispatch hunks). Applying only patch 1 is fine; there is no patch-2-only configuration.
 
 All further `cmake -S <dir>` commands below point at this patched tree.
 
@@ -75,7 +78,7 @@ The same pitfall and remedy are documented independently by the [game.cpp BUILDI
 
 ## 5. Smoke tests
 
-`tests/test_learned_ops.c` checks all four operators against hand-computed references (17 cases, tolerance 1e-3). The bundled scripts automate configure+build+test:
+`tests/test_learned_ops.c` checks patch-1's four operators against hand-computed references (17 cases, tolerance 1e-3). `tests/test_qvac_ops.c` checks patch-2's ten operators (CPU: all ten; on Vulkan the five shader ops run on device and the five CPU-only supertonic ops report a clean SKIP — that is the expected pass state). The bundled scripts automate configure+build+test:
 
 ```bash
 bash scripts/build-and-test.sh            # CPU
@@ -87,10 +90,11 @@ bash scripts/build-and-test.sh vulkan     # CPU + Vulkan
 .\scripts\build-and-test.ps1 -Vulkan      # CPU + Vulkan
 ```
 
-To wire the test by hand, compile it against the patched ggml headers and link `ggml-base`, `ggml-cpu` (plus `ggml-vulkan` / `ggml-cuda` when enabled), making sure the shared libraries are on the loader path. The test binary accepts a backend name and a thread count:
+To wire a test by hand, compile it against the patched ggml headers and link `ggml-base`, `ggml-cpu` (plus `ggml-vulkan` / `ggml-cuda` when enabled), making sure the shared libraries are on the loader path. Each test binary accepts a backend name and a thread count:
 
 ```
 test_learned_ops [cpu | vulkan | cuda] [threads]
+test_qvac_ops    [cpu | vulkan]           # add -DUSE_VULKAN when compiling the vk variant
 ```
 
 Expected tail output per backend:
@@ -104,12 +108,28 @@ Expected tail output per backend:
 ALL PASSED
 ```
 
+```
+== qvac-ops smoke tests (backend: cpu) ==
+[test] supertonic_depthwise_1d / _ct / _causal_ct   ... done
+[test] supertonic_layer_norm_channel / _ct          ... done
+[test] supertonic_pw2_residual / _ct                ... done
+[test] supertonic_bias_gelu / _ct                   ... done
+[test] supertonic_edge_pad_1d / _ct                 ... done
+[test] gru (forward + reverse)                      ... done
+[test] zero_upsample                                ... done
+[test] channel_shuffle                              ... done
+[test] affine_prelu                                 ... done
+[test] snake                                        ... done
+ALL PASSED
+```
+
 ## 6. Benchmarks
 
-`tests/bench_learned_ops.c` is compiled the same way (`USE_VULKAN` / `USE_CUDA` defines). Run it with the matching DLLs on `PATH`:
+`tests/bench_learned_ops.c` and `tests/bench_qvac_ops.c` compile the same way (`USE_VULKAN` / `USE_CUDA` defines). Run with the matching DLLs on `PATH`:
 
 ```
 bench_learned_ops [cpu | vulkan | cuda] [threads]
+bench_qvac_ops    [cpu | vulkan] [threads]
 ```
 
 Notes for trustworthy numbers (all learned the hard way, see [benchmarks.md](benchmarks.md) §Methodology):

@@ -103,3 +103,79 @@ Cross-backend (CPU / Vulkan / CUDA) micro-benchmarks produced by `tests/bench_le
 3. **Single-shot ratios of sub-millisecond GPU kernels carry up to ±50% noise** — the CUDA convT 0.45×↔0.98× flip and the conv-small 0.63×↔1.76× spread are the same phenomenon. All conclusions here rest on stable trends across repeated runs, never on a single measurement.
 4. The legacy convT builder asserts `g=1, p=0, op=0`; shapes outside that envelope can only run on the ext side (legacy column shows "–").
 5. scatter's builder enforces `updates->ne[d] == data->ne[d]` for all `d ≠ axis`; invalid combinations are rejected by assertion.
+
+---
+
+# Patch 2 — the ten qvac fused operators
+
+Benchmarks produced by `tests/bench_qvac_ops.c` (`fused` = the new single-dispatch op; `composed` = the equivalent stock-ggml sub-graph; `speedup = composed / fused`). Same machine as above (RTX 2070, 8-thread CPU, MSVC 2019 AVX2), ggml v0.19.0 + both patches. **Median over 20 timed repeats** (3 warmups) — patch 1 used the mean, but sub-millisecond stability here demanded the median.
+
+## Fused vs composed (CPU, 8 threads)
+
+| case | fused ms | composed ms | speedup |
+|---|---|---|---|
+| snake 2048×64 | 0.410 | 1.350 | **3.29×** |
+| snake 8192×128 | 2.195 | 4.840 | **2.20×** |
+| snake 32768×32 | 1.252 | 5.705 | **4.56×** |
+| bias_gelu 1024×256 | 0.816 | 1.182 | 1.45× |
+| bias_gelu 4096×512 | 6.113 | 10.588 | **1.73×** |
+| bias_gelu 1024×1024 | 2.027 | 3.696 | 1.82× |
+| pw2_residual 1024×256 | 0.061 | 0.568 | **9.37×** |
+| pw2_residual 4096×512 | 0.460 | 4.348 | **9.46×** |
+| affine_prelu 64×256×32 | 1.563 | 2.866 | 1.83× |
+| affine_prelu 128×512×64 | 12.528 | 20.091 | 1.60× |
+| channel_shuffle 4096×64 G8 | 0.055 | 0.047 | 0.85× |
+| channel_shuffle 32768×128 G4 | 0.741 | 0.588 | 0.79× |
+| zero_upsample 256×1 s4 | 0.009 | 0.026 | 2.78× |
+| zero_upsample 1024×8 s2 | 0.010 | 0.141 | **14.87×** |
+| depthwise_1d 4096×64 K7 | 0.739 | 21.907 | **29.64×** |
+| depthwise_1d 16384×128 K7 | 10.029 | 192.425 | **19.19×** |
+| edge_pad_1d 4096×64 p3/3 | 0.151 | 2.039 | **13.51×** |
+| edge_pad_1d 16384×128 p7/7 | 1.189 | 15.206 | **12.79×** |
+| LN_channel 1024×256 | 0.689 | 1.813 | **2.63×** |
+| LN_channel 4096×512 | 15.457 | 12.852 | 0.83× |
+
+(Second run cross-checked; numbers reproduce within ±10% except sub-0.05 ms rows.)
+
+### CPU read-out
+
+- **The two im2col-class fusions dominate**: `depthwise_1d` (19–30×) and `edge_pad_1d` (13×) eliminate the F16 im2col scratch tensor and the concat/repeat copies respectively.
+- **Node-count-dominated fusions deliver 2.5–15×**: `pw2_residual`, `zero_upsample`, `snake` — each removes 2–4 kernel dispatches.
+- **Honest regressions on this CPU**: `channel_shuffle` (0.79–0.85×) — the composed view chain on contiguous planes compiles to large `memcpy`s that beat per-plane gather; and `LN_channel` at C=512 (0.83×) — the stock chain's permute gives the vectorizer friendlier innermost strides. Both remain wins on GPU dispatch counts and on the `[C,T]` layouts the engines actually use.
+
+## Fused vs composed (Vulkan, RTX 2070)
+
+| case | fused ms | composed ms | speedup |
+|---|---|---|---|
+| snake 2048×64 | 0.109 | 0.180 | 1.65× |
+| snake 8192×128 | 0.126 | 0.480 | **3.81×** |
+| snake 32768×32 | 0.127 | 0.493 | **3.89×** |
+| affine_prelu 64×256×32 | 0.123 | 0.431 | **3.51×** |
+| affine_prelu 128×512×64 | 0.276–0.291 | 1.739–1.752 | **6.0–6.3×** |
+| channel_shuffle 4096×64 G8 | 0.118 | 0.129 | 1.09× |
+| channel_shuffle 32768×128 G4 | 0.285 | 0.229 | 0.80× |
+| zero_upsample 256×1 s4 | 0.147 | 0.136 | 0.93× |
+| zero_upsample 1024×8 s2 | 0.106 | 0.142 | 1.34× |
+| pw2_residual / bias_gelu / depthwise / edge_pad / LN | — | measured | fused not ported to Vulkan (CPU fallback; upstream qvac ships them as Metal kernels) |
+
+The five Vulkan shader ops behave as designed: `snake` and `affine_prelu` — the two that replace multi-kernel broadcast chains — show the real GPU wins (up to 3.9× and 6.3×); copy-class ops (`channel_shuffle`, `zero_upsample`) hover at parity since the composed chains already fuse into single copies on GPU.
+
+## `GRU` (absolute; no stock equivalent exists)
+
+| backend | H | B | L | reverse | ms |
+|---|---|---|---|---|---|
+| CPU | 64 | 1 | 256 | no | 4.93 |
+| CPU | 128 | 8 | 128 | no | 11.11 |
+| CPU | 256 | 1 | 64 | yes | 19.58 |
+| CPU | 512 | 4 | 32 | yes | 47.29 |
+| Vulkan (RTX 2070) | 64 | 1 | 256 | no | 2.23 |
+| Vulkan | 128 | 8 | 128 | no | 4.27 |
+| Vulkan | H ≥ 256 | | | | SKIP (H ≤ 128 shared-memory cap; CPU fallback) |
+
+Stock ggml has no RNN cell — the comparison column is the *existence* of this row. The Vulkan packed kernel (128 lanes = `128/H` batch elements per workgroup) is ~2× the CPU at H ≤ 128.
+
+## Patch-2 methodology notes
+
+6. Same harness rules as patch 1 (fresh backend + galloc per variant, no sched). The Vulkan per-variant lifecycle requirement re-confirmed: reusing a subcontext across graph shapes crashes.
+7. `snake` on Vulkan reuses the stock `snake_f32` pipeline (the v0.19 base already carries a graph-level snake fusion with identical math), so its fused column measures the *op-dispatch* path, not a new shader.
+8. The `channel_shuffle` composed chain on Vulkan/CPU is a near-optimal single-copy — treat its speedup < 1 as "no win where none is possible", not as a defect.

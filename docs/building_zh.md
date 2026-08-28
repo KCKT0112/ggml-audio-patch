@@ -20,8 +20,11 @@
 git clone https://github.com/ggml-org/ggml.git ggml-src
 cd ggml-src
 git checkout 30bf868                       # v0.19.0
-git apply <本仓库路径>/patches/learned-ops-ggml0190.patch
+git apply <本仓库路径>/patches/learned-ops-ggml0190.patch   # 补丁一（必需）
+git apply <本仓库路径>/patches/qvac-ops-ggml0190.patch      # 补丁二（可选，顺序应用）
 ```
+
+补丁二必须**在补丁一之后**应用（两者触碰相同的枚举断言与分发代码块）。只用补丁一完全可行；不存在"只用补丁二"的用法。
 
 下文中所有 `cmake -S <dir>` 都指向这份打过 patch 的源码树。
 
@@ -75,7 +78,7 @@ cmake ... -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/C
 
 ## 5. 冒烟测试
 
-`tests/test_learned_ops.c` 用手写参考值核对全部四个算子（17 个用例，容差 1e-3）。仓库自带脚本一键完成 配置+编译+测试：
+`tests/test_learned_ops.c` 用手写参考值核对补丁一的全部四个算子（17 个用例，容差 1e-3）。`tests/test_qvac_ops.c` 核对补丁二的十个算子（CPU：全部十个；Vulkan 下五个 shader 算子跑在设备上、五个纯 CPU 的 supertonic 算子会打印 SKIP——这就是预期的通过状态）。仓库自带脚本一键完成 配置+编译+测试：
 
 ```bash
 bash scripts/build-and-test.sh            # CPU
@@ -91,6 +94,7 @@ bash scripts/build-and-test.sh vulkan     # CPU + Vulkan
 
 ```
 test_learned_ops [cpu | vulkan | cuda] [threads]
+test_qvac_ops    [cpu | vulkan]           # vk 变体编译时加 -DUSE_VULKAN
 ```
 
 每个后端的预期结尾输出：
@@ -104,12 +108,28 @@ test_learned_ops [cpu | vulkan | cuda] [threads]
 ALL PASSED
 ```
 
+```
+== qvac-ops smoke tests (backend: cpu) ==
+[test] supertonic_depthwise_1d / _ct / _causal_ct   ... done
+[test] supertonic_layer_norm_channel / _ct          ... done
+[test] supertonic_pw2_residual / _ct                ... done
+[test] supertonic_bias_gelu / _ct                   ... done
+[test] supertonic_edge_pad_1d / _ct                 ... done
+[test] gru (forward + reverse)                      ... done
+[test] zero_upsample                                ... done
+[test] channel_shuffle                              ... done
+[test] affine_prelu                                 ... done
+[test] snake                                        ... done
+ALL PASSED
+```
+
 ## 6. 性能基准
 
-`tests/bench_learned_ops.c` 编译方式同上（按需加 `USE_VULKAN` / `USE_CUDA` 宏）。运行时把对应 DLL 目录加进 `PATH`：
+`tests/bench_learned_ops.c` 与 `tests/bench_qvac_ops.c` 编译方式同上（按需加 `USE_VULKAN` / `USE_CUDA` 宏）。运行时把对应 DLL 目录加进 `PATH`：
 
 ```
 bench_learned_ops [cpu | vulkan | cuda] [threads]
+bench_qvac_ops    [cpu | vulkan] [threads]
 ```
 
 取信数据的注意事项（都是踩坑换来的，详见 [benchmarks_zh.md](benchmarks_zh.md) §方法论）：

@@ -90,3 +90,32 @@ vk_device 成员 / pipeline 成员 / push-constants 结构
 - v0.19 中 `ggml_backend_alloc_ctx_tensors_from_buft` 不是公开 API；测试用 galloc（中间结果）+ 无 alloc ctx 建图即可。
 - 多后端 `ggml_backend_sched` 要求后端列表最后一个必须是 CPU；但在该基线上用 {GPU, CPU} 的 sched 跑混合 op 图出现分配异常（mul_mat 输出与 im2col 输出共享 buffer、节点疑似未执行）——测试改用 **galloc + 单后端 graph_compute** 绕开（这也是 llama.cpp 单 GPU 场景的主流路径）。
 - Windows 下程序如可能中途崩溃，`main()` 开头加 `setvbuf(stdout, NULL, _IONBF, 0)`，否则崩溃时缓冲内的全部输出会丢失。
+
+---
+
+# 补丁二移植笔记（qvac 算子）
+
+从单一供体树（tetherto/qvac-ext-ggml 的 `speech` 分支）向更老基线（v0.19.0）批量移植十个算子，踩出了补丁一单算子经验之外的新坑：
+
+## 7. 供体与基线的版本漂移
+
+- **供体树比目标基线新**。qvac 的 ggml 是 v0.20 时代的 dlopen-variant 树（760 个文件不同）。绝不能整文件拷贝；每个算子按"插入点 diff"移植。枚举数值区间不同（供体 `GGML_OP_COUNT` = 107，基线补丁一之前是 104）——`ggml.c` 里**两处** `static_assert(GGML_OP_COUNT == N)` 都要更新，别只改一处。
+- **移植前先查基线已有什么**。v0.19 基线的 Vulkan 后端本来就有图级 snake 融合（`snake_pattern` = mul→sin→sqr→mul→add，外加 `snake_f32` pipeline 与 `snake.comp`）。照搬供体导致重复的 `vk_op_snake_push_constants`、重复的 `pipeline_snake_f32` 成员与第二个 `string_to_spv("snake_f32", ...)`——重定义错误加 pipeline 名冲突。正解：**复用上游 pipeline**（其数学与 binding 布局 `{x, a, inv_b, dst}` 与供体完全一致），删除全部重复注册。规则：移植算子 X 之前，先 `git grep -i x` 基线，找出会撞名的名字（shader 名、push-constant 结构体、pipeline 成员、`string_to_spv` 键）。
+- **COL2IM_1D 与 ROLL 在 v0.19 上游已存在**——供体的这两个 builder/kernel 不能移植。只有基线枚举里没有的算子才移植。
+
+## 8. Vulkan 重注册清单（每个算子）
+
+新算子必须全部触及，否则编译失败或分发出错：push-constant 结构体 → pipeline 成员 → `ggml_vk_create_pipeline`（对齐 `parameter_count`、`wg_denoms`）→ `vulkan-shaders-gen.cpp` 的 `string_to_spv` → `ggml_vk_op_get_pipeline` case → `ggml_vk_op_f32` 的 `elements` case → 分发 wrapper → graph-compute switch case → `supports_op` →（仅调试）`vk_check_results` clone 链。补丁一的 `elements` 约定备注在这里泛化：通用 unary 组按扁平 512×512 切分计算；按 2-D 索引（`i0 + i1*ne0`）的 shader 需要自己的 `elements = {ne0, ne1, 1}` case，别加进那个组。
+
+## 9. 列主序测试陷阱
+
+- 供体的 CPU 内核按 **ggml 列主序**索引缓冲（`[L, C]` 张量取 `x[t + c*L]`）。用行主序（`x[t*C + c]`）写的参考能编译、能运行、然后处处失败。症状：每个 case 都"错成另一个元素的值"而不是差个量级。改测试的索引，别改内核。
+- 多结果测试（同一算子的 layout-0 vs layout-1 变体）必须把**每个结果根**都展开进前向图——`ggml_build_forward_expand` 只拉取你传入的根可达的节点。建了但没作为根（或不可从根到达）的张量在图分配器里**没有 buffer**，第一次对它 `tensor_set` 就死在 `GGML_ASSERT(buf != NULL && "tensor buffer not set")`。三个变体（`_1d`、`_ct`、`_causal_ct`）时三个根都要展开，即使非 causal case 里 causal 那个是 `NULL`。
+
+## 10. PowerShell 生成 patch 的坑
+
+在 PowerShell 5.1 里 `git diff > file` 会写出 **UTF-16 LE**（BOM `FF FE` 让 `git apply` 报 "No valid patches in input"）。用 `cmd /c "git diff ... > file"` 或 `git diff --output=file` 生成，并确认文件头几字节是 ASCII `d i f f`。
+
+## 11. ggml_pad 是按维度加，不是按两侧加
+
+给融合 depthwise 算子写对照组合图时：`ggml_pad(x, p0, p0, 0, 0)` 是给 **ne0 和 ne1 各加 p0**（按维度尺寸），不是给 ne0 两侧各加 p0。same-padding 1D 卷积链直接用 `ggml_conv_1d_dw(w, x, s, p0, d)`——builder 本身收 padding——不要显式 pad。（显式对称 pad 应写 `ggml_pad(x, 2*p0, 0, 0, 0)`。）

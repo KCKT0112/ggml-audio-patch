@@ -1,0 +1,3247 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 32b8890..c0e8f39 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -595,6 +595,36 @@ extern "C" {
+         GGML_OP_SCATTER_ELEMENTS,
+         GGML_OP_REL_POS_BIAS,
+ 
++        // qvac-ops patch (ported from tetherto/qvac-ext-ghml, speech branch, MIT)
++        // Supertonic-specific fused ops (QVAC overlay).  These collapse
++        // multi-op sub-graphs that the Supertonic ggml port emits per
++        // ConvNeXt block / attention block, reducing per-step overhead.
++        GGML_OP_SUPERTONIC_DEPTHWISE_1D,
++        GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL,
++        GGML_OP_SUPERTONIC_PW2_RESIDUAL,
++        GGML_OP_SUPERTONIC_BIAS_GELU,
++        GGML_OP_SUPERTONIC_EDGE_PAD_1D,
++
++        // Fused batched GRU (LavaSR denoiser): the whole recurrent sweep over
++        // the L time-steps as one op, parallel over the batch.
++        GGML_OP_GRU,
++
++        // Zero-insertion upsample along ne0 (LavaSR denoiser transpose-conv):
++        // out[i0*s] = in[i0], zeros between, in one pass.
++        GGML_OP_ZERO_UPSAMPLE,
++
++        // Channel shuffle over ne2 (LavaSR denoiser): one plane copy per
++        // output channel instead of a permute/reshape/transpose/cont chain.
++        GGML_OP_CHANNEL_SHUFFLE,
++
++        // Fused affine + per-channel PReLU (LavaSR denoiser):
++        // out = x*aw + ab + max(x,0) + slope*min(x,0).
++        GGML_OP_AFFINE_PRELU,
++
++        // Snake activation y = x + sin^2(a*x) * inv_b, per-channel a / inv_b
++        // (ACE-Step Oobleck VAE).
++        GGML_OP_SNAKE,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -2575,6 +2605,135 @@ extern "C" {
+             int                   H,
+             int                   W);
+ 
++    // --- qvac-ops patch: Supertonic fused ConvNeXt ops (QVAC overlay) ----
++    // Ported from tetherto/qvac-ext-ghml (speech branch, MIT).
++    //
++    // Fused depthwise-conv1d + bias with edge-clamp (or causal-left)
++    // padding; collapses pad + im2col + mul_mat + bias into one dispatch.
++    // a:    [L, C]  f32 contiguous (layout=0); [C, L] for the _ct variants
++    // w:    [K, 1, C, 1]  f32 contiguous, K in {3, 5} (causal: {3,5,7})
++    // bias: [C] f32 contiguous (may be NULL)
++    // dilation: positive integer
++    GGML_API struct ggml_tensor * ggml_supertonic_depthwise_1d(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * bias,
++            int                   dilation);
++    GGML_API struct ggml_tensor * ggml_supertonic_depthwise_1d_ct(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * bias,
++            int                   dilation);
++    // [C, T]-layout + causal-left padding variant (vocoder ConvNeXt chain).
++    GGML_API struct ggml_tensor * ggml_supertonic_depthwise_1d_causal_ct(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * bias,
++            int                   dilation);
++
++    // Fused channel-axis layer norm + affine, single dispatch:
++    //   y[t, c] = ((a[t, c] - mean_t) / sqrt(var_t + eps)) * g[c] + b[c]
++    // a: [L, C, 1, 1] f32 contiguous; g, b: [C] f32 contiguous.
++    GGML_API struct ggml_tensor * ggml_supertonic_layer_norm_channel(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * g,
++            struct ggml_tensor  * b,
++            float                 eps);
++    // [C, T]-layout variant.
++    GGML_API struct ggml_tensor * ggml_supertonic_layer_norm_channel_ct(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * g,
++            struct ggml_tensor  * b,
++            float                 eps);
++
++    // Fused (x + bias) * gamma + residual.  bias/gamma are [C]; x and
++    // residual are [L, C, 1, 1] f32 contiguous.
++    //   y[t, c] = residual[t, c] + (x[t, c] + bias[c]) * gamma[c]
++    GGML_API struct ggml_tensor * ggml_supertonic_pw2_residual(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * bias,
++            struct ggml_tensor  * gamma,
++            struct ggml_tensor  * residual);
++    GGML_API struct ggml_tensor * ggml_supertonic_pw2_residual_ct(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * bias,
++            struct ggml_tensor  * gamma,
++            struct ggml_tensor  * residual);
++
++    // Fused bias-add + GELU (erf form); bias: [C], x: [L, C, 1, 1] f32.
++    GGML_API struct ggml_tensor * ggml_supertonic_bias_gelu(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * bias);
++    GGML_API struct ggml_tensor * ggml_supertonic_bias_gelu_ct(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * bias);
++
++    // Edge-replicate 1D padding (matches pad_left + pad_right side copies):
++    //   y[t, c] = x[clamp(t - pad_left, 0, L_in - 1), c]
++    // x: [L_in, C, 1, 1] -> [L_in + pad_left + pad_right, C, 1, 1].
++    GGML_API struct ggml_tensor * ggml_supertonic_edge_pad_1d(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            int                   pad_left,
++            int                   pad_right);
++    GGML_API struct ggml_tensor * ggml_supertonic_edge_pad_1d_ct(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            int                   pad_left,
++            int                   pad_right);
++
++    // --- qvac-ops patch: LavaSR denoiser ops --------------------------------
++    // Fused batched GRU, PyTorch semantics (gate order r,z,n; reset on hh
++    // new-gate; h0=0).  whh [H,3H]; gi_all [3H,B,L] = precomputed Wih*x+bih;
++    // bhh [3H] -> [H,B,L]; reverse flips t.
++    GGML_API struct ggml_tensor * ggml_gru(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * whh,
++            struct ggml_tensor  * gi_all,
++            struct ggml_tensor  * bhh,
++            bool                  reverse);
++
++    // Zero-insertion upsample of ne0 by factor s: result ne0 = (a->ne0 - 1)*s + 1,
++    // result[i0*s, ...] = a[i0, ...], zeros elsewhere.  a must be contiguous.
++    GGML_API struct ggml_tensor * ggml_zero_upsample(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   s);
++
++    // Channel shuffle of ne2 into `groups` groups (PyTorch): result channel c' =
++    // a channel (c'%groups)*(ne2/groups) + c'/groups. a contiguous, ne2 % groups == 0.
++    GGML_API struct ggml_tensor * ggml_channel_shuffle(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   groups);
++
++    // Fused affine + per-channel PReLU: out = x*aw + ab + max(x,0) + slope*min(x,0).
++    // x [F,T,C,Bc] contiguous; aw,ab [F,C] (per freq,channel); slope [C].
++    GGML_API struct ggml_tensor * ggml_affine_prelu(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * aw,
++            struct ggml_tensor  * ab,
++            struct ggml_tensor  * slope);
++
++    // --- qvac-ops patch: ACE-Step Oobleck VAE activation --------------------
++    // snake activation: y = x + sin^2(a*x) * inv_b, per-channel a / inv_b.
++    // x: [T, C] contiguous; a, inv_b: one per channel (numel == x->ne[1]).
++    GGML_API struct ggml_tensor * ggml_snake(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,      // [T, C]
++            struct ggml_tensor  * a,      // per-channel scale inside sin(), F32
++            struct ggml_tensor  * inv_b); // per-channel output scale, F32
++
+     GGML_API struct ggml_tensor * ggml_rwkv_wkv6(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * k,
+diff --git a/src/ggml-backend-meta.cpp b/src/ggml-backend-meta.cpp
+index b0096ba..5345a56 100644
+--- a/src/ggml-backend-meta.cpp
++++ b/src/ggml-backend-meta.cpp
+@@ -945,6 +945,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             } break;
+             case GGML_OP_PAD_REFLECT_1D:
+             case GGML_OP_ROLL:
++            case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
++            case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
++            case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
++            case GGML_OP_SUPERTONIC_BIAS_GELU:
++            case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
++            case GGML_OP_GRU:
++            case GGML_OP_ZERO_UPSAMPLE:
++            case GGML_OP_CHANNEL_SHUFFLE:
++            case GGML_OP_AFFINE_PRELU:
++            case GGML_OP_SNAKE:
+             case GGML_OP_ARANGE:
+             case GGML_OP_TIMESTEP_EMBEDDING: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index b4b6eee..be8fdaa 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1977,6 +1977,46 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_pad_reflect_1d(params, tensor);
+             } break;
++        case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
++            {
++                ggml_compute_forward_supertonic_depthwise_1d(params, tensor);
++            } break;
++        case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
++            {
++                ggml_compute_forward_supertonic_layer_norm_channel(params, tensor);
++            } break;
++        case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
++            {
++                ggml_compute_forward_supertonic_pw2_residual(params, tensor);
++            } break;
++        case GGML_OP_SUPERTONIC_BIAS_GELU:
++            {
++                ggml_compute_forward_supertonic_bias_gelu(params, tensor);
++            } break;
++        case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
++            {
++                ggml_compute_forward_supertonic_edge_pad_1d(params, tensor);
++            } break;
++        case GGML_OP_SNAKE:
++            {
++                ggml_compute_forward_snake(params, tensor);
++            } break;
++        case GGML_OP_ZERO_UPSAMPLE:
++            {
++                ggml_compute_forward_zero_upsample(params, tensor);
++            } break;
++        case GGML_OP_CHANNEL_SHUFFLE:
++            {
++                ggml_compute_forward_channel_shuffle(params, tensor);
++            } break;
++        case GGML_OP_AFFINE_PRELU:
++            {
++                ggml_compute_forward_affine_prelu(params, tensor);
++            } break;
++        case GGML_OP_GRU:
++            {
++                ggml_compute_forward_gru(params, tensor);
++            } break;
+         case GGML_OP_ROLL:
+             {
+                 ggml_compute_forward_roll(params, tensor);
+@@ -2408,6 +2448,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_UPSCALE:
+         case GGML_OP_PAD:
+         case GGML_OP_PAD_REFLECT_1D:
++        case GGML_OP_SUPERTONIC_DEPTHWISE_1D:
++        case GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL:
++        case GGML_OP_SUPERTONIC_PW2_RESIDUAL:
++        case GGML_OP_SUPERTONIC_BIAS_GELU:
++        case GGML_OP_SUPERTONIC_EDGE_PAD_1D:
++        case GGML_OP_GRU:
++        case GGML_OP_ZERO_UPSAMPLE:
++        case GGML_OP_CHANNEL_SHUFFLE:
++        case GGML_OP_AFFINE_PRELU:
++        case GGML_OP_SNAKE:
+         case GGML_OP_ROLL:
+         case GGML_OP_ARANGE:
+         case GGML_OP_TIMESTEP_EMBEDDING:
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 768e907..d8b2315 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -11,6 +11,7 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <vector>
+ 
+ // ggml_compute_forward_dup
+ 
+@@ -10589,6 +10590,485 @@ void ggml_compute_forward_rel_pos_bias(const ggml_compute_params * params, ggml_
+     }
+ }
+ 
++// =========================================================================
++// qvac-ops patch: CPU kernels (ported from tetherto/qvac-ext-ggml, MIT)
++// =========================================================================
++
++// ggml_compute_forward_supertonic_depthwise_1d
++
++void ggml_compute_forward_supertonic_depthwise_1d(
++        const ggml_compute_params * params,
++              ggml_tensor * dst) {
++
++    const ggml_tensor * x    = dst->src[0]; // [L, C, 1, 1]
++    const ggml_tensor * w    = dst->src[1]; // [K, 1, C, 1]
++    const ggml_tensor * bias = dst->src[2]; // [C] or NULL
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(w->type == GGML_TYPE_F32);
++    GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    const int32_t * opts = (const int32_t *) dst->op_params;
++    const int K        = opts[0];
++    const int dilation = opts[1];
++    const int32_t layout = opts[2];
++    const int32_t causal = opts[3];
++    const int k_off = (causal != 0) ? -(K - 1) : -(K / 2);
++
++    int L, C, sxt, sxc, syt, syc;
++    if (layout == 0) {
++        L = (int) x->ne[0];
++        C = (int) x->ne[1];
++        sxt = 1;  sxc = L;
++        syt = 1;  syc = L;
++    } else {
++        C = (int) x->ne[0];
++        L = (int) x->ne[1];
++        sxt = C;  sxc = 1;
++        syt = C;  syc = 1;
++    }
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const float * x_data = (const float *) x->data;
++    const float * w_data = (const float *) w->data;
++    const float * b_data = bias ? (const float *) bias->data : NULL;
++          float * y_data = (float *) dst->data;
++
++    for (int c = ith; c < C; c += nth) {
++        const float bias_v = b_data ? b_data[c] : 0.0f;
++        const float * w_c = w_data + (size_t) c * K;
++        for (int t = 0; t < L; ++t) {
++            float sum = bias_v;
++            for (int k = 0; k < K; ++k) {
++                int s = t + (k + k_off) * dilation;
++                if (s < 0) s = 0;
++                else if (s >= L) s = L - 1;
++                sum += x_data[(size_t) s * sxt + (size_t) c * sxc] * w_c[k];
++            }
++            y_data[(size_t) t * syt + (size_t) c * syc] = sum;
++        }
++    }
++}
++
++// ggml_compute_forward_supertonic_layer_norm_channel
++
++void ggml_compute_forward_supertonic_layer_norm_channel(
++        const ggml_compute_params * params,
++              ggml_tensor * dst) {
++
++    const ggml_tensor * x = dst->src[0]; // [L, C, 1, 1]
++    const ggml_tensor * g = dst->src[1]; // [C]
++    const ggml_tensor * b = dst->src[2]; // [C]
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(g->type == GGML_TYPE_F32);
++    GGML_ASSERT(b->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    float eps;
++    memcpy(&eps, dst->op_params, sizeof(eps));
++    const int32_t layout = ((const int32_t *) dst->op_params)[1];
++
++    int L, C, sxt, sxc, syt, syc;
++    if (layout == 0) {
++        // [T, C]: T inner.
++        L = (int) x->ne[0];
++        C = (int) x->ne[1];
++        sxt = 1;  sxc = L;
++        syt = 1;  syc = L;
++    } else {
++        // [C, T]: C inner.
++        C = (int) x->ne[0];
++        L = (int) x->ne[1];
++        sxt = C;  sxc = 1;
++        syt = C;  syc = 1;
++    }
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const float * x_data = (const float *) x->data;
++    const float * g_data = (const float *) g->data;
++    const float * b_data = (const float *) b->data;
++          float * y_data = (float *) dst->data;
++
++    // Layout-agnostic indexing via element strides.
++    for (int t = ith; t < L; t += nth) {
++        double mean = 0.0;
++        for (int c = 0; c < C; ++c) mean += x_data[(size_t) t * sxt + (size_t) c * sxc];
++        mean /= (double) C;
++        double var = 0.0;
++        for (int c = 0; c < C; ++c) {
++            const double d = (double) x_data[(size_t) t * sxt + (size_t) c * sxc] - mean;
++            var += d * d;
++        }
++        const float inv = 1.0f / sqrtf((float) (var / (double) C) + eps);
++        for (int c = 0; c < C; ++c) {
++            const float xv = x_data[(size_t) t * sxt + (size_t) c * sxc];
++            y_data[(size_t) t * syt + (size_t) c * syc] = (xv - (float) mean) * inv * g_data[c] + b_data[c];
++        }
++    }
++}
++
++// ggml_compute_forward_supertonic_pw2_residual
++
++void ggml_compute_forward_supertonic_pw2_residual(
++        const ggml_compute_params * params,
++              ggml_tensor * dst) {
++
++    const ggml_tensor * x        = dst->src[0]; // [L, C, 1, 1]
++    const ggml_tensor * bias     = dst->src[1]; // [C]
++    const ggml_tensor * gamma    = dst->src[2]; // [C]
++    const ggml_tensor * residual = dst->src[3]; // [L, C, 1, 1]
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(gamma->type == GGML_TYPE_F32);
++    GGML_ASSERT(residual->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    const int32_t layout = ((const int32_t *) dst->op_params)[0];
++
++    int L, C, sxt, sxc, syt, syc, srt, src;
++    if (layout == 0) {
++        L = (int) x->ne[0];
++        C = (int) x->ne[1];
++        sxt = 1;  sxc = L;
++        syt = 1;  syc = L;
++        srt = 1;  src = L;
++    } else {
++        C = (int) x->ne[0];
++        L = (int) x->ne[1];
++        sxt = C;  sxc = 1;
++        syt = C;  syc = 1;
++        srt = C;  src = 1;
++    }
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const float * x_data   = (const float *) x->data;
++    const float * b_data   = (const float *) bias->data;
++    const float * g_data   = (const float *) gamma->data;
++    const float * r_data   = (const float *) residual->data;
++          float * y_data   = (float *) dst->data;
++
++    // Stripe over channels.  For each channel c, bias and gamma are read
++    // once and applied across all L timesteps; layout flag flips x/y/r index
++    // strides between [T, C] and [C, T].
++    for (int c = ith; c < C; c += nth) {
++        const float bv = b_data[c];
++        const float gv = g_data[c];
++        for (int t = 0; t < L; ++t) {
++            const float xv = x_data[(size_t) t * sxt + (size_t) c * sxc];
++            const float rv = r_data[(size_t) t * srt + (size_t) c * src];
++            y_data[(size_t) t * syt + (size_t) c * syc] = rv + (xv + bv) * gv;
++        }
++    }
++}
++
++// ggml_compute_forward_supertonic_bias_gelu
++
++void ggml_compute_forward_supertonic_bias_gelu(
++        const ggml_compute_params * params,
++              ggml_tensor * dst) {
++
++    const ggml_tensor * x    = dst->src[0]; // [L, C, 1, 1]
++    const ggml_tensor * bias = dst->src[1]; // [C]
++
++    GGML_ASSERT(x->type    == GGML_TYPE_F32);
++    GGML_ASSERT(bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
++
++    const int32_t layout = ((const int32_t *) dst->op_params)[0];
++
++    int L, C, sxt, sxc, syt, syc;
++    if (layout == 0) {
++        L = (int) x->ne[0];
++        C = (int) x->ne[1];
++        sxt = 1;  sxc = L;
++        syt = 1;  syc = L;
++    } else {
++        C = (int) x->ne[0];
++        L = (int) x->ne[1];
++        sxt = C;  sxc = 1;
++        syt = C;  syc = 1;
++    }
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const float * x_data = (const float *) x->data;
++    const float * b_data = (const float *) bias->data;
++          float * y_data = (float *)       dst->data;
++
++    static const float inv_sqrt_2 = 0.7071067811865475f;
++
++    for (int c = ith; c < C; c += nth) {
++        const float bv = b_data[c];
++        for (int t = 0; t < L; ++t) {
++            const float v = x_data[(size_t) t * sxt + (size_t) c * sxc] + bv;
++            y_data[(size_t) t * syt + (size_t) c * syc] = 0.5f * v * (1.0f + erff(v * inv_sqrt_2));
++        }
++    }
++}
++
++// ggml_compute_forward_supertonic_edge_pad_1d
++
++void ggml_compute_forward_supertonic_edge_pad_1d(
++        const ggml_compute_params * params,
++              ggml_tensor * dst) {
++
++    const ggml_tensor * x = dst->src[0]; // [L_in, C, 1, 1] or [C, L_in, 1, 1]
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    const int pad_left = ggml_get_op_params_i32(dst, 0);
++    const int32_t layout = ggml_get_op_params_i32(dst, 2);
++
++    int L_in, L_out, C, sxt, sxc, syt, syc;
++    if (layout == 0) {
++        L_in  = (int) x->ne[0];
++        C     = (int) x->ne[1];
++        L_out = (int) dst->ne[0];
++        sxt = 1;     sxc = L_in;   syt = 1;     syc = L_out;
++    } else {
++        C     = (int) x->ne[0];
++        L_in  = (int) x->ne[1];
++        L_out = (int) dst->ne[1];
++        sxt = C;     sxc = 1;      syt = C;     syc = 1;
++    }
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const float * x_data = (const float *) x->data;
++          float * y_data = (float *)       dst->data;
++
++    // Stripe over channels.  For each output time t, read from
++    // clamp(t - pad_left, 0, L_in - 1); layout flag picks strides.
++    for (int c = ith; c < C; c += nth) {
++        for (int t = 0; t < L_out; ++t) {
++            int src_t = t - pad_left;
++            if (src_t < 0)       src_t = 0;
++            if (src_t >= L_in)   src_t = L_in - 1;
++            y_data[(size_t) t * syt + (size_t) c * syc] =
++                x_data[(size_t) src_t * sxt + (size_t) c * sxc];
++        }
++    }
++}
++
++// ggml_compute_forward_snake
++//
++// Snake activation y = x + sin^2(a*x) * inv_b, with per-channel a and inv_b.
++// x / dst are [T, C] (T = ne0, contiguous); a and inv_b hold one F32 value per
++// channel.  Parallelized over channels (threads own disjoint [c*T, (c+1)*T)
++// bands).  ACE-Step Oobleck VAE.  CPU bring-up: F32 only.
++void ggml_compute_forward_snake(
++        const ggml_compute_params * params,
++              ggml_tensor * dst) {
++
++    const ggml_tensor * x     = dst->src[0];
++    const ggml_tensor * a     = dst->src[1];
++    const ggml_tensor * inv_b = dst->src[2];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && inv_b->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++
++    const int64_t T = x->ne[0];
++    const int64_t C = x->ne[1];
++
++    const float * xd = (const float *) x->data;
++    const float * ad = (const float *) a->data;
++    const float * bd = (const float *) inv_b->data;
++          float * yd = (float *)       dst->data;
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    // Split over channels: each thread owns disjoint time bands.
++    for (int64_t c = ith; c < C; c += nth) {
++        const float ac = ad[c];
++        const float bc = bd[c];
++        const float * xc = xd + c * T;
++              float * yc = yd + c * T;
++        for (int64_t t = 0; t < T; t++) {
++            const float xi = xc[t];
++            const float si = sinf(ac * xi);
++            yc[t] = xi + si * si * bc;
++        }
++    }
++}
++
++// Fused batched GRU reference (CPU).  Parallel over batch b; serial over the L time-steps.
++//   whh [H,3H], gi_all [3H,B,L] (precomputed Wih*x+bih), bhh [3H] -> dst [H,B,L].
++void ggml_compute_forward_gru(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * whh    = dst->src[0];  // [H, 3H]
++    const ggml_tensor * gi_all = dst->src[1];  // [3H, B, L]
++    const ggml_tensor * bhh    = dst->src[2];  // [3H]
++
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && whh->type == GGML_TYPE_F32 &&
++                gi_all->type == GGML_TYPE_F32 && bhh->type == GGML_TYPE_F32);
++
++    const int64_t H  = whh->ne[0];
++    const int64_t H3 = gi_all->ne[0];   // 3H
++    const int64_t B  = gi_all->ne[1];
++    const int64_t L  = gi_all->ne[2];
++    const bool reverse = ggml_get_op_params_i32(dst, 0) != 0;
++
++    const float * whh_d = (const float *) whh->data;    // whh[k + H*g]  (column g = whh_d + H*g)
++    const float * gi_d  = (const float *) gi_all->data; // gi[g + H3*b + H3*B*t]
++    const float * bhh_d = (const float *) bhh->data;    // bhh[g]
++    float *       dst_d = (float *)       dst->data;    // dst[j + H*b + H*B*t]
++
++    std::vector<float> h((size_t) H), gh((size_t) H3);
++
++    const int64_t per = (B + params->nth - 1) / params->nth;
++    const int64_t b0  = (int64_t) params->ith * per;
++    const int64_t b1  = std::min(b0 + per, B);
++
++    for (int64_t b = b0; b < b1; ++b) {
++        for (int64_t j = 0; j < H; ++j) h[j] = 0.0f;   // zero initial state
++        for (int64_t s = 0; s < L; ++s) {
++            const int64_t t  = reverse ? (L - 1 - s) : s;
++            const float * gi = gi_d + (H3 * b + H3 * B * t);
++            for (int64_t g = 0; g < H3; ++g) {          // gh = whh*h + bhh
++                const float * wcol = whh_d + H * g;
++                float acc = 0.0f;
++                for (int64_t k = 0; k < H; ++k) acc += wcol[k] * h[k];
++                gh[g] = acc + bhh_d[g];
++            }
++            float * out = dst_d + (H * b + H * B * t);
++            for (int64_t j = 0; j < H; ++j) {
++                const float r  = 1.0f / (1.0f + expf(-(gi[j]          + gh[j])));
++                const float z  = 1.0f / (1.0f + expf(-(gi[H + j]      + gh[H + j])));
++                const float nc = tanhf(gi[2 * H + j] + r * gh[2 * H + j]);
++                const float hn = nc + z * (h[j] - nc);   // h_new = nc + z*(h - nc)
++                h[j]   = hn;
++                out[j] = hn;
++            }
++        }
++    }
++}
++
++void ggml_compute_forward_zero_upsample(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src = dst->src[0];
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
++
++    const int64_t s  = ggml_get_op_params_i32(dst, 0);
++    const int64_t F  = src->ne[0];
++    const int64_t Fu = dst->ne[0];
++    const int64_t R  = src->ne[1] * src->ne[2] * src->ne[3];   // rows (ne1*ne2*ne3)
++
++    const float * src_data = (const float *) src->data;
++    float       * dst_data = (float *) dst->data;
++
++    // parallel over rows: zero each output row, then scatter the input at stride s.
++    const int64_t per_thread = (R + params->nth - 1) / params->nth;
++    const int64_t start = params->ith * per_thread;
++    const int64_t end   = MIN(start + per_thread, R);
++
++    for (int64_t r = start; r < end; ++r) {
++        const float * sp = src_data + r * F;
++        float       * dp = dst_data + r * Fu;
++        for (int64_t i = 0; i < Fu; ++i) dp[i] = 0.0f;
++        for (int64_t f = 0; f < F; ++f) dp[f * s] = sp[f];
++    }
++}
++
++void ggml_compute_forward_channel_shuffle(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src = dst->src[0];
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
++
++    const int64_t G  = ggml_get_op_params_i32(dst, 0);
++    const int64_t FT = src->ne[0] * src->ne[1];
++    const int64_t C  = src->ne[2];
++    const int64_t Bc = src->ne[3];
++    const int64_t cg = C / G;
++
++    const float * src_data = (const float *) src->data;
++    float       * dst_data = (float *) dst->data;
++
++    // parallel over output planes (c' + C*b): copy the FT plane from the shuffled input channel.
++    const int64_t nplanes = C * Bc;
++    const int64_t per_thread = (nplanes + params->nth - 1) / params->nth;
++    const int64_t start = params->ith * per_thread;
++    const int64_t end   = MIN(start + per_thread, nplanes);
++
++    for (int64_t p = start; p < end; ++p) {
++        const int64_t cprime = p % C;
++        const int64_t b      = p / C;
++        const int64_t in_c   = (cprime % G) * cg + cprime / G;
++        const float * sp = src_data + (in_c + C * b) * FT;
++        float       * dp = dst_data + p * FT;
++        for (int64_t i = 0; i < FT; ++i) dp[i] = sp[i];
++    }
++}
++
++void ggml_compute_forward_affine_prelu(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * x     = dst->src[0];
++    const ggml_tensor * aw    = dst->src[1];
++    const ggml_tensor * ab    = dst->src[2];
++    const ggml_tensor * slope = dst->src[3];
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
++
++    const int64_t F  = x->ne[0];
++    const int64_t T  = x->ne[1];
++    const int64_t C  = x->ne[2];
++    const int64_t Bc = x->ne[3];
++
++    const float * xd  = (const float *) x->data;
++    const float * awd = (const float *) aw->data;
++    const float * abd = (const float *) ab->data;
++    const float * sld = (const float *) slope->data;
++    float       * dd  = (float *) dst->data;
++
++    // parallel over planes (c + C*b); per element: affine + per-channel prelu in scalar op order.
++    const int64_t nplanes = C * Bc;
++    const int64_t per_thread = (nplanes + params->nth - 1) / params->nth;
++    const int64_t start = params->ith * per_thread;
++    const int64_t end   = MIN(start + per_thread, nplanes);
++
++    for (int64_t p = start; p < end; ++p) {
++        const int64_t c   = p % C;
++        const float * awc = awd + c * F;
++        const float * abc = abd + c * F;
++        const float   sl  = sld[c];
++        const float * xp  = xd + p * F * T;
++        float       * dp  = dd + p * F * T;
++        for (int64_t i = 0; i < F * T; ++i) {
++            const float xv = xp[i];
++            const float r  = xv > 0.0f ? xv : 0.0f;
++            const float n  = xv - r;
++            const float pr = r + sl * n;
++            const float a  = xv * awc[i % F] + abc[i % F];
++            dp[i] = a + pr;
++        }
++    }
++}
++
+ // ggml_compute_forward_rwkv_wkv6
+ 
+ static void ggml_compute_forward_rwkv_wkv6_f32(
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index 20099eb..b0a540d 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -122,6 +122,17 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
+ void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++// qvac-ops patch (ported from tetherto/qvac-ext-ggml, MIT)
++void ggml_compute_forward_supertonic_depthwise_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_supertonic_layer_norm_channel(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_supertonic_pw2_residual(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_supertonic_bias_gelu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_supertonic_edge_pad_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_gru(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_zero_upsample(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_channel_shuffle(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_affine_prelu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_snake(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 70b1a45..6eb7def 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -958,6 +958,13 @@ struct vk_device_struct {
+     vk_pipeline pipeline_clamp[2];
+     vk_pipeline pipeline_pad_f32;
+     vk_pipeline pipeline_roll_f32;
++    // qvac-ops patch pipelines (ported from tetherto/qvac-ext-ggml, MIT)
++    // (snake reuses the upstream pipeline_snake_f32 / snake_f32_len)
++    vk_pipeline pipeline_gru_f32;
++    vk_pipeline pipeline_gru_small_f32[3];  // H == 2, 4, 8 register-resident variants
++    vk_pipeline pipeline_zero_upsample_f32;
++    vk_pipeline pipeline_channel_shuffle_f32;
++    vk_pipeline pipeline_affine_prelu_f32;
+     vk_pipeline pipeline_repeat_i32, pipeline_repeat_back_f32;
+     vk_pipeline pipeline_repeat_i16;
+     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_bf16_f32, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
+@@ -1682,6 +1689,25 @@ struct vk_op_rms_norm_mul_rope_push_constants {
+     vk_op_rope_push_constants rope;
+ };
+ 
++// qvac-ops patch push constants (ported from tetherto/qvac-ext-ggml, MIT)
++// NOTE: snake reuses the upstream vk_op_snake_push_constants {ne0, ne1}
++// and the upstream snake_f32 pipeline (same math / binding layout).
++struct vk_op_gru_push_constants {
++    uint32_t H, B, L, reverse;
++};
++
++struct vk_op_zero_upsample_push_constants {
++    uint32_t ne, F, Fu, s;
++};
++
++struct vk_op_channel_shuffle_push_constants {
++    uint32_t ne, FT, C, G;
++};
++
++struct vk_op_affine_prelu_push_constants {
++    uint32_t ne, F, FT, C;
++};
++
+ struct vk_op_soft_max_push_constants {
+     uint32_t KX;
+     uint32_t KY;
+@@ -5619,6 +5645,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_roll_f32, "roll_f32", roll_f32_len, roll_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+ 
++    // qvac-ops patch pipelines (ported from tetherto/qvac-ext-ggml, MIT)
++    ggml_vk_create_pipeline(device, device->pipeline_gru_f32, "gru_f32", gru_f32_len, gru_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[0], "gru_small_h2_f32", gru_small_h2_f32_len, gru_small_h2_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[1], "gru_small_h4_f32", gru_small_h4_f32_len, gru_small_h4_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_gru_small_f32[2], "gru_small_h8_f32", gru_small_h8_f32_len, gru_small_h8_f32_data, "main", 4, sizeof(vk_op_gru_push_constants), {1, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_zero_upsample_f32, "zero_upsample_f32", zero_upsample_f32_len, zero_upsample_f32_data, "main", 2, sizeof(vk_op_zero_upsample_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_channel_shuffle_f32, "channel_shuffle_f32", channel_shuffle_f32_len, channel_shuffle_f32_data, "main", 2, sizeof(vk_op_channel_shuffle_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_affine_prelu_f32, "affine_prelu_f32", affine_prelu_f32_len, affine_prelu_f32_data, "main", 5, sizeof(vk_op_affine_prelu_push_constants), {512, 1, 1}, {}, 1);
++
+     ggml_vk_create_pipeline(device, device->pipeline_repeat_i32, "repeat_i32", repeat_i32_len, repeat_i32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_repeat_back_f32, "repeat_back_f32", repeat_back_f32_len, repeat_back_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+ 
+@@ -11275,6 +11310,39 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             return ctx->device->pipeline_roll_f32;
+         }
+         return nullptr;
++    case GGML_OP_GRU:
++        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            // tiny hidden sizes: one-lane-per-batch register-resident variant
++            // (no barriers in the L loop); the packed kernel covers the rest.
++            switch (src0->ne[0]) {
++                case 2: return ctx->device->pipeline_gru_small_f32[0];
++                case 4: return ctx->device->pipeline_gru_small_f32[1];
++                case 8: return ctx->device->pipeline_gru_small_f32[2];
++                default: break;
++            }
++            return ctx->device->pipeline_gru_f32;
++        }
++        return nullptr;
++    case GGML_OP_ZERO_UPSAMPLE:
++        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_zero_upsample_f32;
++        }
++        return nullptr;
++    case GGML_OP_CHANNEL_SHUFFLE:
++        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_channel_shuffle_f32;
++        }
++        return nullptr;
++    case GGML_OP_AFFINE_PRELU:
++        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_affine_prelu_f32;
++        }
++        return nullptr;
++    case GGML_OP_SNAKE:
++        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_snake_f32;
++        }
++        return nullptr;
+     case GGML_OP_REPEAT:
+         if (ggml_type_size(src0->type) == sizeof(float) && ggml_type_size(dst->type) == sizeof(float)) {
+             return ctx->device->pipeline_repeat_i32;
+@@ -12197,6 +12265,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+     case GGML_OP_UNARY:
+     case GGML_OP_GLU:
+     case GGML_OP_CONV_2D_DW:
++    case GGML_OP_ZERO_UPSAMPLE:
++    case GGML_OP_CHANNEL_SHUFFLE:
++    case GGML_OP_AFFINE_PRELU:
+         {
+             uint32_t ne = ggml_nelements(dst);
+             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
+@@ -12275,6 +12346,22 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+             const uint32_t B = ((const uint32_t *)dst->op_params)[2];
+             elements = { W, H, B * H * W };
+         } break;
++    case GGML_OP_GRU:
++        {
++            // small-H: one lane per batch element; packed kernel: 128-lane WGs each covering
++            // PB = floor(128/H) batch elements (supports_op guarantees 1 <= H <= 128; must match the shaders).
++            const uint32_t H  = (uint32_t)src0->ne[0];
++            const uint32_t B  = (uint32_t)src1->ne[1];
++            const uint32_t PB = (H == 2 || H == 4 || H == 8) ? 128 : 128 / H;
++            elements = { 1, CEIL_DIV(B, PB), 1 };
++        }
++        break;
++    case GGML_OP_SNAKE:
++        {
++            // upstream snake_f32 shader: 2D grid ne0 x ne1, pc {ne0, ne1}
++            elements = { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 1 };
++        }
++        break;
+     default:
+         elements = { (uint32_t)ggml_nelements(src0), 1, 1 };
+         break;
+@@ -14065,6 +14152,74 @@ static void ggml_vk_rel_pos_bias(ggml_backend_vk_context * ctx, vk_context& subc
+     ggml_vk_op_f32<vk_op_rel_pos_bias_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_REL_POS_BIAS, std::move(pc));
+ }
+ 
++// qvac-ops patch dispatch wrappers (ported from tetherto/qvac-ext-ggml, MIT)
++
++static void ggml_vk_gru(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];  // whh [H, 3H]
++    const ggml_tensor * src1 = dst->src[1];  // gi_all [3H, B, L]
++    const ggml_tensor * src2 = dst->src[2];  // bhh [3H]
++
++    ggml_vk_op_f32<vk_op_gru_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_GRU, {
++        (uint32_t)src0->ne[0],
++        (uint32_t)src1->ne[1],
++        (uint32_t)src1->ne[2],
++        (uint32_t)ggml_get_op_params_i32(dst, 0),
++    });
++}
++
++static void ggml_vk_zero_upsample(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++
++    ggml_vk_op_f32<vk_op_zero_upsample_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ZERO_UPSAMPLE, {
++        (uint32_t)ggml_nelements(dst),
++        (uint32_t)src0->ne[0],
++        (uint32_t)dst->ne[0],
++        (uint32_t)ggml_get_op_params_i32(dst, 0),
++    });
++}
++
++static void ggml_vk_channel_shuffle(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++
++    ggml_vk_op_f32<vk_op_channel_shuffle_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_CHANNEL_SHUFFLE, {
++        (uint32_t)ggml_nelements(dst),
++        (uint32_t)(src0->ne[0] * src0->ne[1]),
++        (uint32_t)src0->ne[2],
++        (uint32_t)ggml_get_op_params_i32(dst, 0),
++    });
++}
++
++static void ggml_vk_affine_prelu(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];  // x [F, T, C, Bc]
++    const ggml_tensor * src1 = dst->src[1];  // aw [F, C]
++    const ggml_tensor * src2 = dst->src[2];  // ab [F, C]
++    const ggml_tensor * src3 = dst->src[3];  // slope [C]
++
++    ggml_vk_op_f32<vk_op_affine_prelu_push_constants>(ctx, subctx, src0, src1, src2, src3, dst, GGML_OP_AFFINE_PRELU, {
++        (uint32_t)ggml_nelements(dst),
++        (uint32_t)src0->ne[0],
++        (uint32_t)(src0->ne[0] * src0->ne[1]),
++        (uint32_t)src0->ne[2],
++    });
++}
++
++static void ggml_vk_snake(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];  // x     [T, C]
++    const ggml_tensor * src1 = dst->src[1];  // a     [C]
++    const ggml_tensor * src2 = dst->src[2];  // inv_b [C]
++
++    // Reuses the upstream snake_f32 pipeline (y = x + sin(b*x)^2*c with
++    // b = a, c = inv_b): bindings {x, a, inv_b, dst}, pc {ne0, ne1},
++    // 2D thread grid ne0 x ne1.
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++
++    vk_op_snake_push_constants pc{};
++    pc.ne0 = static_cast<uint32_t>(src0->ne[0]);
++    pc.ne1 = static_cast<uint32_t>(src0->ne[1]);
++
++    ggml_vk_op_f32<vk_op_snake_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SNAKE, std::move(pc));
++}
++
+ static void ggml_vk_scatter_elements(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+     const ggml_tensor * data    = dst->src[0];
+     const ggml_tensor * updates = dst->src[1];
+@@ -15717,6 +15872,26 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+     case GGML_OP_SCATTER_ELEMENTS:
+         ggml_vk_scatter_elements(ctx, compute_ctx, node);
+ 
++        break;
++    case GGML_OP_GRU:
++        ggml_vk_gru(ctx, compute_ctx, node);
++
++        break;
++    case GGML_OP_ZERO_UPSAMPLE:
++        ggml_vk_zero_upsample(ctx, compute_ctx, node);
++
++        break;
++    case GGML_OP_CHANNEL_SHUFFLE:
++        ggml_vk_channel_shuffle(ctx, compute_ctx, node);
++
++        break;
++    case GGML_OP_SNAKE:
++        ggml_vk_snake(ctx, compute_ctx, node);
++
++        break;
++    case GGML_OP_AFFINE_PRELU:
++        ggml_vk_affine_prelu(ctx, compute_ctx, node);
++
+         break;
+     case GGML_OP_POOL_1D:
+         ggml_vk_pool_1d(ctx, compute_ctx, src0, node);
+@@ -18605,6 +18780,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 && op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32
+                 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op)
+                 && (ggml_get_op_params_i32(op, 0) != 1 || device->shader_atomic_float_add);
++        case GGML_OP_GRU:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                   op->src[0]->ne[0] <= 128;   // hidden size H <= GRU_MAX_H (shared-mem cap)
++        case GGML_OP_ZERO_UPSAMPLE:
++            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                   ggml_is_contiguous(op->src[0]);
++        case GGML_OP_CHANNEL_SHUFFLE:
++            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                   ggml_is_contiguous(op->src[0]);
++        case GGML_OP_AFFINE_PRELU:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                   op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
++                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
++        case GGML_OP_SNAKE:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+         case GGML_OP_COL2IM_1D:
+             return (op->src[0]->type == GGML_TYPE_F32 ||
+                     op->src[0]->type == GGML_TYPE_F16 ||
+@@ -19568,6 +19761,17 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+             const int32_t s2 = tensor->op_params[2];
+             const int32_t s3 = tensor->op_params[3];
+             tensor_clone = ggml_roll(ggml_ctx, src_clone[0], s0, s1, s2, s3);
++        } else if (tensor->op == GGML_OP_GRU) {
++            tensor_clone = ggml_gru(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
++                                    ggml_get_op_params_i32(tensor, 0) != 0);
++        } else if (tensor->op == GGML_OP_ZERO_UPSAMPLE) {
++            tensor_clone = ggml_zero_upsample(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
++        } else if (tensor->op == GGML_OP_CHANNEL_SHUFFLE) {
++            tensor_clone = ggml_channel_shuffle(ggml_ctx, src_clone[0], ggml_get_op_params_i32(tensor, 0));
++        } else if (tensor->op == GGML_OP_AFFINE_PRELU) {
++            tensor_clone = ggml_affine_prelu(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
++        } else if (tensor->op == GGML_OP_SNAKE) {
++            tensor_clone = ggml_snake(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+         }
+         else {
+             std::cerr << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;
+diff --git a/src/ggml-vulkan/vulkan-shaders/affine_prelu.comp b/src/ggml-vulkan/vulkan-shaders/affine_prelu.comp
+new file mode 100644
+index 0000000..263aa3b
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/affine_prelu.comp
+@@ -0,0 +1,40 @@
++#version 450
++
++#include "types.glsl"
++
++// Fused affine + per-channel PReLU (LavaSR denoiser), scalar op order:
++// out = x*aw[f,c] + ab[f,c] + (max(x,0) + slope[c]*min(x,0)).  One thread per element.
++layout (push_constant) uniform parameter
++{
++    uint ne;   // total dst elements
++    uint F;    // ne0
++    uint FT;   // ne0*ne1 (plane size)
++    uint C;    // ne2 (channels)
++} p;
++
++layout (binding = 0) readonly buffer X  {float data_x[];};
++layout (binding = 1) readonly buffer AW {float data_aw[];};
++layout (binding = 2) readonly buffer AB {float data_ab[];};
++layout (binding = 3) readonly buffer SL {float data_sl[];};
++layout (binding = 4) writeonly buffer D {float data_d[];};
++
++layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++
++void main() {
++    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
++    if (idx >= p.ne) {
++        return;
++    }
++
++    const uint pl = idx / p.FT;        // plane = c + C*b
++    const uint i  = idx - pl * p.FT;   // f + F*t
++    const uint c  = pl % p.C;
++    const uint f  = i % p.F;
++
++    const float xv = data_x[idx];
++    const float r  = max(xv, 0.0f);
++    const float n  = xv - r;
++    const float pr = r + data_sl[c] * n;
++    const float a  = xv * data_aw[c * p.F + f] + data_ab[c * p.F + f];
++    data_d[idx] = a + pr;
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/channel_shuffle.comp b/src/ggml-vulkan/vulkan-shaders/channel_shuffle.comp
+new file mode 100644
+index 0000000..941fa6c
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/channel_shuffle.comp
+@@ -0,0 +1,33 @@
++#version 450
++
++#include "types.glsl"
++
++// Channel shuffle (G groups) along ne2 (PyTorch, LavaSR denoiser): output plane
++// c' copies input plane (c'%G)*(C/G) + c'/G.  One thread per dst element (gather).
++layout (push_constant) uniform parameter
++{
++    uint ne;   // total dst elements
++    uint FT;   // ne0*ne1 (plane size)
++    uint C;    // ne2 (channels)
++    uint G;    // groups
++} p;
++
++layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
++
++layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++
++void main() {
++    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
++    if (idx >= p.ne) {
++        return;
++    }
++
++    const uint pl = idx / p.FT;        // output plane = c' + C*b
++    const uint ft = idx - pl * p.FT;
++    const uint c  = pl % p.C;
++    const uint b  = pl / p.C;
++    const uint ic = (c % p.G) * (p.C / p.G) + c / p.G;
++
++    data_d[idx] = D_TYPE(data_a[(ic + p.C * b) * p.FT + ft]);
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/gru.comp b/src/ggml-vulkan/vulkan-shaders/gru.comp
+new file mode 100644
+index 0000000..1bba77d
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/gru.comp
+@@ -0,0 +1,77 @@
++#version 450
++
++#include "types.glsl"
++
++// Fused batched GRU (PyTorch: gate order r,z,n, reset on hh new-gate, h0=0).
++// whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L]; 128-lane WG packs 128/H batch elems.
++#define GRU_MAX_H 128
++
++layout (push_constant) uniform parameter
++{
++    uint H;
++    uint B;
++    uint L;
++    uint reverse;
++} p;
++
++layout (binding = 0) readonly buffer W {float data_whh[];};
++layout (binding = 1) readonly buffer G {float data_gi[];};
++layout (binding = 2) readonly buffer BH {float data_bhh[];};
++layout (binding = 3) writeonly buffer D {float data_d[];};
++
++layout(local_size_x = GRU_MAX_H, local_size_y = 1, local_size_z = 1) in;
++
++shared float h_l[GRU_MAX_H];        // flat, slot-major: h_l[b_local*H + j] == h_l[lane]
++shared float gh_l[3 * GRU_MAX_H];   // flat: gh_l[b_local*3H + g]
++
++void main() {
++    const uint lane    = gl_LocalInvocationID.x;
++    const uint PB      = GRU_MAX_H / p.H;                   // batch elems per WG (uniform)
++    const uint b_local = lane / p.H;                        // slot in this WG
++    const uint j       = lane - b_local * p.H;              // hidden unit
++    const uint b       = gl_WorkGroupID.y * PB + b_local;   // global batch element
++    const uint H3      = 3u * p.H;
++    const uint hbase   = b_local * p.H;                     // == lane - j
++    const uint gbase   = b_local * H3;
++
++    // Ragged (128 % H != 0) and batch-tail lanes idle but run every barrier.
++    const bool lane_live = (b_local < PB) && (b < p.B);
++
++    if (lane_live) {
++        h_l[lane] = 0.0f;                                   // zero initial state
++    }
++    barrier();
++
++    // barrier()s stay in uniform control flow: every lane runs all L steps.
++    for (uint s = 0u; s < p.L; ++s) {
++        const uint t       = (p.reverse != 0u) ? (p.L - 1u - s) : s;
++        const uint gi_base = H3 * b + H3 * p.B * t;
++
++        // pass 1: gh[g] = sum_k whh[k,g]*h[k] + bhh[g] for this lane's 3 gate rows
++        // (CPU reference order: bias added after the accumulation).
++        if (lane_live) {
++            for (uint gg = 0u; gg < 3u; ++gg) {
++                const uint g     = gg * p.H + j;
++                const uint wbase = p.H * g;
++                float acc = 0.0f;
++                for (uint k = 0u; k < p.H; ++k) {
++                    acc += data_whh[wbase + k] * h_l[hbase + k];
++                }
++                gh_l[gbase + g] = acc + data_bhh[g];
++            }
++        }
++        barrier();
++
++        // pass 2: gates + state update (each lane touches only h_l[lane]).
++        // exp/tanh args saturated: some mobile drivers NaN on exp overflow (>~88.7) not +inf; clamps bit-equal in fp32.
++        if (lane_live) {
++            const float r  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + j] + gh_l[gbase + j]), 88.0f)));
++            const float z  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + p.H + j] + gh_l[gbase + p.H + j]), 88.0f)));
++            const float nc = tanh(clamp(data_gi[gi_base + 2u * p.H + j] + r * gh_l[gbase + 2u * p.H + j], -15.0f, 15.0f));
++            const float hn = nc + z * (h_l[lane] - nc);
++            data_d[p.H * b + p.H * p.B * t + j] = hn;
++            h_l[lane] = hn;
++        }
++        barrier();
++    }
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/gru_small.comp b/src/ggml-vulkan/vulkan-shaders/gru_small.comp
+new file mode 100644
+index 0000000..1d90032
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/gru_small.comp
+@@ -0,0 +1,77 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : require
++
++#include "types.glsl"
++
++// Small-H fused GRU compiled per exact H (H_C; host selects p.H == H_C); fp op order matches
++// CPU reference / gru.comp exactly. whh [H,3H], gi [3H,B,L], bhh [3H] -> dst [H,B,L].
++#define WG_SIZE 128
++
++layout (push_constant) uniform parameter
++{
++    uint H;
++    uint B;
++    uint L;
++    uint reverse;
++} p;
++
++layout (binding = 0) readonly buffer W {float data_whh[];};
++layout (binding = 1) readonly buffer G {float data_gi[];};
++layout (binding = 2) readonly buffer BH {float data_bhh[];};
++layout (binding = 3) writeonly buffer D {float data_d[];};
++
++layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
++
++shared float w_sh[H_C * 3 * H_C];   // whh, k-major per gate row
++shared float b_sh[3 * H_C];         // bhh
++
++void main() {
++    const uint lane = gl_LocalInvocationID.x;
++    const uint b    = gl_WorkGroupID.y * WG_SIZE + lane;    // global batch element
++    const uint H3   = 3u * H_C;
++
++    for (uint i = lane; i < H_C * H3; i += WG_SIZE) {
++        w_sh[i] = data_whh[i];
++    }
++    if (lane < H3) {
++        b_sh[lane] = data_bhh[lane];
++    }
++    barrier();
++
++    if (b >= p.B) {
++        return;                                             // after the only barrier
++    }
++
++    float h[H_C];
++    float gh[3 * H_C];
++    [[unroll]] for (uint j = 0u; j < H_C; ++j) {
++        h[j] = 0.0f;                                        // zero initial state
++    }
++
++    for (uint s = 0u; s < p.L; ++s) {
++        const uint t       = (p.reverse != 0u) ? (p.L - 1u - s) : s;
++        const uint gi_base = H3 * b + H3 * p.B * t;
++
++        // gh[g] = sum_k whh[k,g]*h[k] + bhh[g] (bias after accumulation, CPU order).
++        [[unroll]] for (uint g = 0u; g < 3u * H_C; ++g) {
++            float acc = 0.0f;
++            [[unroll]] for (uint k = 0u; k < H_C; ++k) {
++                acc += w_sh[H_C * g + k] * h[k];
++            }
++            gh[g] = acc + b_sh[g];
++        }
++
++        // gates + state update; exp/tanh args saturated (mobile drivers NaN on
++        // exp overflow instead of +inf); clamps bit-equivalent in fp32.
++        const uint obase = H_C * b + H_C * p.B * t;
++        [[unroll]] for (uint j = 0u; j < H_C; ++j) {
++            const float r  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + j] + gh[j]), 88.0f)));
++            const float z  = 1.0f / (1.0f + exp(min(-(data_gi[gi_base + H_C + j] + gh[H_C + j]), 88.0f)));
++            const float nc = tanh(clamp(data_gi[gi_base + 2u * H_C + j] + r * gh[2u * H_C + j], -15.0f, 15.0f));
++            const float hn = nc + z * (h[j] - nc);
++            data_d[obase + j] = hn;
++            h[j] = hn;
++        }
++    }
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 347155c..ac78e08 100644
+--- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1050,6 +1050,16 @@ void process_shaders() {
+     string_to_spv("scatter_elements_none", "scatter_elements.comp", {});
+     string_to_spv("scatter_elements_add", "scatter_elements.comp", {{"SCATTER_ADD", "1"}});
+ 
++    // qvac-ops patch (ported from tetherto/qvac-ext-ggml, MIT)
++    // (snake reuses the upstream snake_f32 pipeline)
++    string_to_spv("gru_f32",             "gru.comp",             {{"A_TYPE", "float"}});
++    string_to_spv("gru_small_h2_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "2"}});
++    string_to_spv("gru_small_h4_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "4"}});
++    string_to_spv("gru_small_h8_f32",    "gru_small.comp",       {{"A_TYPE", "float"}, {"H_C", "8"}});
++    string_to_spv("zero_upsample_f32",   "zero_upsample.comp",   {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
++    string_to_spv("channel_shuffle_f32", "channel_shuffle.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
++    string_to_spv("affine_prelu_f32",    "affine_prelu.comp",    {{"A_TYPE", "float"}});
++
+     string_to_spv("col2im_1d_f32",  "col2im_1d.comp", {{"DATA_A_F32", "1"},  {"A_TYPE", "float"},     {"D_TYPE", "float"}});
+     string_to_spv("col2im_1d_f16",  "col2im_1d.comp", {{"DATA_A_F16", "1"},  {"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+     string_to_spv("col2im_1d_bf16", "col2im_1d.comp", {{"DATA_A_BF16", "1"}, {"A_TYPE", "uint16_t"},  {"D_TYPE", "uint16_t"}});
+diff --git a/src/ggml-vulkan/vulkan-shaders/zero_upsample.comp b/src/ggml-vulkan/vulkan-shaders/zero_upsample.comp
+new file mode 100644
+index 0000000..925ebe0
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/zero_upsample.comp
+@@ -0,0 +1,30 @@
++#version 450
++
++#include "types.glsl"
++
++// Zero-insertion upsample of ne0 by s (LavaSR denoiser transpose-conv):
++// dst[f] = (f % s == 0) ? src[f / s] : 0.  One thread per dst element (gather form).
++layout (push_constant) uniform parameter
++{
++    uint ne;   // total dst elements
++    uint F;    // src ne0
++    uint Fu;   // dst ne0 = (F-1)*s+1
++    uint s;    // upsample stride
++} p;
++
++layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
++layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
++
++layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
++
++void main() {
++    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
++    if (idx >= p.ne) {
++        return;
++    }
++
++    const uint r = idx / p.Fu;
++    const uint f = idx - r * p.Fu;
++
++    data_d[idx] = (f % p.s == 0u) ? D_TYPE(data_a[r * p.F + f / p.s]) : D_TYPE(0.0f);
++}
+diff --git a/src/ggml.c b/src/ggml.c
+index 1ecd7cb..49cd3d0 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1102,9 +1102,21 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "IM2COL_FAST_1D",
+     "SCATTER_ELEMENTS",
+     "REL_POS_BIAS",
++
++    "SUPERTONIC_DEPTHWISE_1D",
++    "SUPERTONIC_LAYER_NORM_CHANNEL",
++    "SUPERTONIC_PW2_RESIDUAL",
++    "SUPERTONIC_BIAS_GELU",
++    "SUPERTONIC_EDGE_PAD_1D",
++
++    "GRU",
++    "ZERO_UPSAMPLE",
++    "CHANNEL_SHUFFLE",
++    "AFFINE_PRELU",
++    "SNAKE",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1221,9 +1233,21 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "im2col_fast_1d(x)",
+     "scatter_elements(data, idx, upd)",
+     "rel_pos_bias(x, wcat)",
++
++    "supertonic_depthwise_1d(x,w,b)",
++    "supertonic_layer_norm_channel(x,g,b)",
++    "supertonic_pw2_residual(x,b,gamma,res)",
++    "supertonic_bias_gelu(x,b)",
++    "supertonic_edge_pad_1d(x,pad_l,pad_r)",
++
++    "gru(whh,gi,bhh)",
++    "zero_upsample(x)",
++    "channel_shuffle(x)",
++    "affine_prelu(x,aw,ab,slope)",
++    "snake(x,a,inv_b)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5910,6 +5934,327 @@ struct ggml_tensor * ggml_rel_pos_bias(
+     return result;
+ }
+ 
++// =========================================================================
++// qvac-ops patch: builders (ported from tetherto/qvac-ext-ggml, MIT)
++// =========================================================================
++
++// ggml_supertonic_depthwise_1d
++
++static struct ggml_tensor * ggml_supertonic_depthwise_1d_impl(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * bias,
++        int                   dilation,
++        int                   layout,
++        int                   causal) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(w->type == GGML_TYPE_F32);
++    GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_is_contiguous(w));
++    GGML_ASSERT(bias == NULL || ggml_is_contiguous(bias));
++    GGML_ASSERT(dilation >= 1);
++
++    const int K = (int) w->ne[0];
++    GGML_ASSERT(K == 3 || K == 5 || K == 7);
++    GGML_ASSERT(w->ne[1] == 1);
++    const int64_t C_dim = (layout == 0) ? a->ne[1] : a->ne[0];
++    GGML_ASSERT(w->ne[2] == C_dim);
++    GGML_ASSERT(bias == NULL || bias->ne[0] == C_dim);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type,
++            a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
++
++    int32_t params[4] = { K, dilation, layout, causal };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_SUPERTONIC_DEPTHWISE_1D;
++    result->src[0] = a;
++    result->src[1] = w;
++    result->src[2] = bias;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_supertonic_depthwise_1d(
++        struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * w,
++        struct ggml_tensor * bias, int dilation) {
++    return ggml_supertonic_depthwise_1d_impl(ctx, a, w, bias, dilation, 0, 0);
++}
++struct ggml_tensor * ggml_supertonic_depthwise_1d_ct(
++        struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * w,
++        struct ggml_tensor * bias, int dilation) {
++    return ggml_supertonic_depthwise_1d_impl(ctx, a, w, bias, dilation, 1, 0);
++}
++struct ggml_tensor * ggml_supertonic_depthwise_1d_causal_ct(
++        struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * w,
++        struct ggml_tensor * bias, int dilation) {
++    return ggml_supertonic_depthwise_1d_impl(ctx, a, w, bias, dilation, 1, 1);
++}
++
++// ggml_supertonic_layer_norm_channel
++
++static struct ggml_tensor * ggml_supertonic_layer_norm_channel_impl(
++        struct ggml_context * ctx, struct ggml_tensor * a,
++        struct ggml_tensor * g, struct ggml_tensor * b, float eps, int layout) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(g->type == GGML_TYPE_F32);
++    GGML_ASSERT(b->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_is_contiguous(g));
++    GGML_ASSERT(ggml_is_contiguous(b));
++    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
++    const int64_t C_dim = (layout == 0) ? a->ne[1] : a->ne[0];
++    GGML_ASSERT(g->ne[0] == C_dim);
++    GGML_ASSERT(b->ne[0] == C_dim);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type,
++            a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
++
++    float params[2];
++    memcpy(&params[0], &eps, sizeof(float));
++    ((int32_t *) &params[1])[0] = layout;
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_SUPERTONIC_LAYER_NORM_CHANNEL;
++    result->src[0] = a;
++    result->src[1] = g;
++    result->src[2] = b;
++    return result;
++}
++
++struct ggml_tensor * ggml_supertonic_layer_norm_channel(
++        struct ggml_context * ctx, struct ggml_tensor * a,
++        struct ggml_tensor * g, struct ggml_tensor * b, float eps) {
++    return ggml_supertonic_layer_norm_channel_impl(ctx, a, g, b, eps, 0);
++}
++struct ggml_tensor * ggml_supertonic_layer_norm_channel_ct(
++        struct ggml_context * ctx, struct ggml_tensor * a,
++        struct ggml_tensor * g, struct ggml_tensor * b, float eps) {
++    return ggml_supertonic_layer_norm_channel_impl(ctx, a, g, b, eps, 1);
++}
++
++// ggml_supertonic_pw2_residual
++
++static struct ggml_tensor * ggml_supertonic_pw2_residual_impl(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        struct ggml_tensor * bias, struct ggml_tensor * gamma,
++        struct ggml_tensor * residual, int layout) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(gamma->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(bias));
++    GGML_ASSERT(ggml_is_contiguous(gamma) && ggml_is_contiguous(residual));
++    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
++    GGML_ASSERT(residual->ne[0] == x->ne[0] && residual->ne[1] == x->ne[1]);
++    const int64_t C_dim = (layout == 0) ? x->ne[1] : x->ne[0];
++    GGML_ASSERT(bias->ne[0] == C_dim && gamma->ne[0] == C_dim);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, x->type,
++            x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
++
++    int32_t params[1] = { layout };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_SUPERTONIC_PW2_RESIDUAL;
++    result->src[0] = x;
++    result->src[1] = bias;
++    result->src[2] = gamma;
++    result->src[3] = residual;
++    return result;
++}
++
++struct ggml_tensor * ggml_supertonic_pw2_residual(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        struct ggml_tensor * bias, struct ggml_tensor * gamma,
++        struct ggml_tensor * residual) {
++    return ggml_supertonic_pw2_residual_impl(ctx, x, bias, gamma, residual, 0);
++}
++struct ggml_tensor * ggml_supertonic_pw2_residual_ct(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        struct ggml_tensor * bias, struct ggml_tensor * gamma,
++        struct ggml_tensor * residual) {
++    return ggml_supertonic_pw2_residual_impl(ctx, x, bias, gamma, residual, 1);
++}
++
++// ggml_supertonic_bias_gelu
++
++static struct ggml_tensor * ggml_supertonic_bias_gelu_impl(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        struct ggml_tensor * bias, int layout) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(bias));
++    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
++    const int64_t C_dim = (layout == 0) ? x->ne[1] : x->ne[0];
++    GGML_ASSERT(bias->ne[0] == C_dim);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, x->type,
++            x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
++
++    int32_t params[1] = { layout };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_SUPERTONIC_BIAS_GELU;
++    result->src[0] = x;
++    result->src[1] = bias;
++    return result;
++}
++
++struct ggml_tensor * ggml_supertonic_bias_gelu(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        struct ggml_tensor * bias) {
++    return ggml_supertonic_bias_gelu_impl(ctx, x, bias, 0);
++}
++struct ggml_tensor * ggml_supertonic_bias_gelu_ct(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        struct ggml_tensor * bias) {
++    return ggml_supertonic_bias_gelu_impl(ctx, x, bias, 1);
++}
++
++// ggml_supertonic_edge_pad_1d
++
++static struct ggml_tensor * ggml_supertonic_edge_pad_1d_impl(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        int pad_left, int pad_right, int layout) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
++    GGML_ASSERT(pad_left >= 0 && pad_right >= 0);
++
++    int64_t out_ne0, out_ne1;
++    if (layout == 0) {
++        out_ne0 = x->ne[0] + pad_left + pad_right;
++        out_ne1 = x->ne[1];
++    } else {
++        out_ne0 = x->ne[0];
++        out_ne1 = x->ne[1] + pad_left + pad_right;
++    }
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, x->type,
++            out_ne0, out_ne1, x->ne[2], x->ne[3]);
++
++    int32_t params[3] = { pad_left, pad_right, layout };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_SUPERTONIC_EDGE_PAD_1D;
++    result->src[0] = x;
++    return result;
++}
++
++struct ggml_tensor * ggml_supertonic_edge_pad_1d(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        int pad_left, int pad_right) {
++    return ggml_supertonic_edge_pad_1d_impl(ctx, x, pad_left, pad_right, 0);
++}
++struct ggml_tensor * ggml_supertonic_edge_pad_1d_ct(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        int pad_left, int pad_right) {
++    return ggml_supertonic_edge_pad_1d_impl(ctx, x, pad_left, pad_right, 1);
++}
++
++// ggml_gru
++
++struct ggml_tensor * ggml_gru(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * whh,
++        struct ggml_tensor  * gi_all,
++        struct ggml_tensor  * bhh,
++        bool                  reverse) {
++    GGML_ASSERT(whh->type == GGML_TYPE_F32 && gi_all->type == GGML_TYPE_F32 && bhh->type == GGML_TYPE_F32);
++    GGML_ASSERT(whh->ne[0] * 3 == gi_all->ne[0]);
++    GGML_ASSERT(whh->ne[1] == gi_all->ne[0]);
++    GGML_ASSERT(bhh->ne[0] == gi_all->ne[0]);
++    GGML_ASSERT(ggml_is_contiguous(whh) && ggml_is_contiguous(gi_all) && ggml_is_contiguous(bhh));
++
++    const int64_t H = whh->ne[0];
++    const int64_t B = gi_all->ne[1];
++    const int64_t L = gi_all->ne[2];
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, B, L);
++    ggml_set_op_params_i32(result, 0, reverse ? 1 : 0);
++
++    result->op     = GGML_OP_GRU;
++    result->src[0] = whh;
++    result->src[1] = gi_all;
++    result->src[2] = bhh;
++    return result;
++}
++
++// ggml_zero_upsample
++
++struct ggml_tensor * ggml_zero_upsample(
++        struct ggml_context * ctx, struct ggml_tensor * a, int s) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(s >= 1);
++
++    const int64_t ne0 = (a->ne[0] - 1) * s + 1;
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne0, a->ne[1], a->ne[2], a->ne[3]);
++    ggml_set_op_params_i32(result, 0, s);
++
++    result->op     = GGML_OP_ZERO_UPSAMPLE;
++    result->src[0] = a;
++    return result;
++}
++
++// ggml_channel_shuffle
++
++struct ggml_tensor * ggml_channel_shuffle(
++        struct ggml_context * ctx, struct ggml_tensor * a, int groups) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(groups >= 1 && a->ne[2] % groups == 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
++    ggml_set_op_params_i32(result, 0, groups);
++
++    result->op     = GGML_OP_CHANNEL_SHUFFLE;
++    result->src[0] = a;
++    return result;
++}
++
++// ggml_affine_prelu
++
++struct ggml_tensor * ggml_affine_prelu(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        struct ggml_tensor * aw, struct ggml_tensor * ab,
++        struct ggml_tensor * slope) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && aw->type == GGML_TYPE_F32 &&
++                ab->type == GGML_TYPE_F32 && slope->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
++
++    result->op     = GGML_OP_AFFINE_PRELU;
++    result->src[0] = x;
++    result->src[1] = aw;
++    result->src[2] = ab;
++    result->src[3] = slope;
++    return result;
++}
++
++// ggml_snake
++
++struct ggml_tensor * ggml_snake(
++        struct ggml_context * ctx, struct ggml_tensor * x,
++        struct ggml_tensor * a, struct ggml_tensor * inv_b) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && inv_b->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(inv_b));
++    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
++    GGML_ASSERT(ggml_are_same_shape(a, inv_b));
++    GGML_ASSERT(ggml_nelements(a) == x->ne[1]);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
++                                                     x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
++
++    result->op     = GGML_OP_SNAKE;
++    result->src[0] = x;
++    result->src[1] = a;
++    result->src[2] = inv_b;
++    return result;
++}
++
+ // ggml_rwkv_wkv6
+ 
+ struct ggml_tensor * ggml_rwkv_wkv6(
+diff --git a/tests-learned/bench_qvac_ops.c b/tests-learned/bench_qvac_ops.c
+new file mode 100644
+index 0000000..0374b93
+--- /dev/null
++++ b/tests-learned/bench_qvac_ops.c
+@@ -0,0 +1,616 @@
++// Benchmark: qvac-ops fused kernels vs equivalent composed sub-graphs.
++//
++// Usage: bench_qvac_ops [cpu|vulkan] [threads]
++//
++// Measures end-to-end graph_compute time (median over repeats):
++//   1. snake            vs  mul+sin+sqr+mul+add chain (the 5-op subgraph the
++//                           upstream Vulkan backend has a fusion hook for)
++//   2. bias_gelu        vs  add + gelu_erf
++//   3. pw2_residual     vs  add + mul + add
++//   4. affine_prelu     vs  prelu-composed chain (max/min + mul + add)
++//   5. channel_shuffle  vs  reshape+permute+cont chain
++//   6. zero_upsample    vs  im2col-free naive: repeat + diag-mask style zero
++//                           fill (composed: concat with zeros via upscale)
++//   7. supertonic_depthwise_1d vs pad + conv_1d_dw + bias add
++//   8. supertonic_edge_pad_1d  vs concat of edge tiles
++//   9. gru              (absolute; no native equivalent - RNN gap in ggml)
++//  10. supertonic_layer_norm_channel vs permute+cont+norm+mul+add+permute+cont
++//
++// Reports median over N repeats, ms.
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#ifdef _WIN32
++#include <windows.h>
++static double now_s(void) {
++    static LARGE_INTEGER freq = {0}, base = {0};
++    if (freq.QuadPart == 0) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&base); return 0; }
++    LARGE_INTEGER now; QueryPerformanceCounter(&now);
++    return (double)(now.QuadPart - base.QuadPart) / (double)freq.QuadPart;
++}
++#else
++#include <time.h>
++static double now_s(void) {
++    static struct timespec ts_base = {0,0};
++    if (ts_base.tv_sec == 0) { clock_gettime(CLOCK_MONOTONIC, &ts_base); return 0; }
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (ts.tv_sec - ts_base.tv_sec) + (ts.tv_nsec - ts_base.tv_nsec) * 1e-9;
++}
++#endif
++
++#ifdef USE_VULKAN
++ggml_backend_t             ggml_backend_vk_init(size_t dev_num);
++ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
++#endif
++
++static const char * g_backend = "cpu";
++static int g_threads = 8;
++static int g_warmup  = 3;
++static int g_repeats = 20;
++
++// ---- backend helpers (galloc + direct graph_compute, bypass sched) ----
++
++struct bench {
++    struct ggml_context * ctx;
++    ggml_backend_t backend;
++    ggml_backend_buffer_type_t buft;
++    ggml_gallocr_t galloc;
++    struct ggml_cgraph * gf;
++};
++
++static void bench_begin(struct bench * b) {
++    size_t buf_size = 256u*1024u*1024u;
++    struct ggml_init_params ip = { buf_size, NULL, /* no_alloc */ true };
++    b->ctx = ggml_init(ip);
++    b->backend = NULL; b->buft = NULL; b->galloc = NULL; b->gf = NULL;
++#ifdef USE_VULKAN
++    if (strcmp(g_backend, "vulkan") == 0) {
++        b->backend = ggml_backend_vk_init(0);
++        b->buft = ggml_backend_vk_buffer_type(0);
++        return;
++    }
++#endif
++    b->backend = ggml_backend_cpu_init();
++    b->buft = ggml_backend_cpu_buffer_type();
++    ggml_backend_cpu_set_n_threads(b->backend, g_threads);
++}
++
++static bool bench_graph(struct bench * b, struct ggml_tensor * root) {
++    b->gf = ggml_new_graph(b->ctx);
++    ggml_build_forward_expand(b->gf, root);
++    b->galloc = ggml_gallocr_new(b->buft);
++    if (!ggml_gallocr_alloc_graph(b->galloc, b->gf)) {
++        printf("  galloc failed\n");
++        return false;
++    }
++    return true;
++}
++
++static void bench_upload(struct bench * b, struct ggml_tensor * t, const void * host) {
++    ggml_backend_tensor_set(t, host, 0, ggml_nbytes(t));
++}
++
++static double bench_time_median(struct bench * b) {
++    double samples[64];
++    int n = g_repeats < 64 ? g_repeats : 64;
++    for (int i = 0; i < g_warmup; i++) ggml_backend_graph_compute(b->backend, b->gf);
++    for (int i = 0; i < n; i++) {
++        double t0 = now_s();
++        ggml_backend_graph_compute(b->backend, b->gf);
++        double t1 = now_s();
++        samples[i] = (t1 - t0) * 1000.0;
++    }
++    // median
++    for (int i = 1; i < n; i++) {
++        double key = samples[i]; int j = i - 1;
++        while (j >= 0 && samples[j] > key) { samples[j+1] = samples[j]; j--; }
++        samples[j+1] = key;
++    }
++    return samples[n/2];
++}
++
++static void bench_end(struct bench * b) {
++    if (b->galloc) ggml_gallocr_free(b->galloc);
++    if (b->backend) ggml_backend_free(b->backend);
++    ggml_free(b->ctx);
++}
++
++static float * fill_rand(int n, unsigned seed) {
++    float * p = (float *)malloc((size_t)n * sizeof(float));
++    unsigned s = seed;
++    for (int i = 0; i < n; i++) {
++        s = s * 1103515245u + 12345u;
++        p[i] = (float)((s >> 16) % 2000) * 0.001f - 1.0f;
++    }
++    return p;
++}
++
++// measure one prebuilt graph; -1 when unsupported
++static double time_variant(struct bench * b, struct ggml_tensor * root,
++                           struct ggml_tensor ** inputs, float ** data, int n_in) {
++    if (!ggml_backend_supports_op(b->backend, root)) {
++        bench_end(b);
++        return -1;
++    }
++    if (!bench_graph(b, root)) { bench_end(b); return -1; }
++    for (int i = 0; i < n_in; i++) bench_upload(b, inputs[i], data[i]);
++    double t = bench_time_median(b);
++    bench_end(b);
++    return t;
++}
++
++static void report(const char * name, double fused, double composed) {
++    if (fused < 0 && composed < 0) {
++        printf("  %-34s  SKIP (both unsupported)\n", name);
++    } else if (composed < 0) {
++        printf("  %-34s  fused %8.4f ms   (composed unsupported)\n", name, fused);
++    } else if (fused < 0) {
++        printf("  %-34s  composed %8.4f ms  (fused unsupported)\n", name, composed);
++    } else {
++        printf("  %-34s  fused %8.4f ms  composed %8.4f ms  speedup %.2fx\n",
++               name, fused, composed, composed / fused);
++    }
++}
++
++// ============ 1. snake vs 5-op chain ============
++
++static void bench_snake(void) {
++    printf("\n--- snake vs mul+sin+sqr+mul+add (%s) ---\n", g_backend);
++    printf("  %8s %6s | %11s %11s %8s\n", "T", "C", "fused ms", "chain ms", "speedup");
++
++    struct { int T, C; } cases[] = {
++        {2048, 64}, {8192, 128}, {32768, 32},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int T = cases[c].T, C = cases[c].C;
++        float * px  = fill_rand(T*C, 11 + (unsigned)c);
++        float * pa  = fill_rand(C, 5 + (unsigned)c);
++        float * pib = fill_rand(C, 9 + (unsigned)c);
++
++        // fused
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * x  = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, T, C);
++        struct ggml_tensor * a  = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * ib = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * rf = ggml_snake(b.ctx, x, a, ib);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){x, a, ib},
++                                 (float *[]){px, pa, pib}, 3);
++
++        // composed chain: y = x + inv_b * sin(a*x)^2
++        //   m1 = mul(x, a_broadcast) ; s = sin(m1) ; sq = sqr(s)
++        //   m2 = mul(sq, inv_b_bcast); y = add(x, m2)
++        bench_begin(&b);
++        x  = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, T, C);
++        a  = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        ib = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * a_b  = ggml_repeat(b.ctx, a, x);
++        struct ggml_tensor * m1   = ggml_mul(b.ctx, x, a_b);
++        struct ggml_tensor * sn   = ggml_sin(b.ctx, m1);
++        struct ggml_tensor * sq   = ggml_sqr(b.ctx, sn);
++        struct ggml_tensor * ib_b = ggml_repeat(b.ctx, ib, x);
++        struct ggml_tensor * m2   = ggml_mul(b.ctx, sq, ib_b);
++        struct ggml_tensor * rc   = ggml_add(b.ctx, x, m2);
++        double tc = time_variant(&b, rc, (struct ggml_tensor *[]){x, a, ib},
++                                 (float *[]){px, pa, pib}, 3);
++
++        char name[64]; snprintf(name, sizeof(name), "snake %dx%d", T, C);
++        report(name, tf, tc);
++        free(px); free(pa); free(pib);
++    }
++}
++
++// ============ 2. bias_gelu vs add+gelu ============
++
++static void bench_bias_gelu(void) {
++    printf("\n--- supertonic_bias_gelu vs add+gelu_erf (%s) ---\n", g_backend);
++    printf("  %8s %6s | %11s %11s %8s\n", "L", "C", "fused ms", "chain ms", "speedup");
++
++    struct { int L, C; } cases[] = {
++        {1024, 256}, {4096, 512}, {1024, 1024},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C;
++        float * px = fill_rand(L*C, 21 + (unsigned)c);
++        float * pb = fill_rand(C, 23 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * x = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * bi = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * rf = ggml_supertonic_bias_gelu(b.ctx, x, bi);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){x, bi},
++                                 (float *[]){px, pb}, 2);
++
++        bench_begin(&b);
++        x  = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        bi = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * bib = ggml_repeat(b.ctx, bi, x);
++        struct ggml_tensor * ad  = ggml_add(b.ctx, x, bib);
++        struct ggml_tensor * rc  = ggml_gelu_erf(b.ctx, ad);
++        double tc = time_variant(&b, rc, (struct ggml_tensor *[]){x, bi},
++                                 (float *[]){px, pb}, 2);
++
++        char name[64]; snprintf(name, sizeof(name), "bias_gelu %dx%d", L, C);
++        report(name, tf, tc);
++        free(px); free(pb);
++    }
++}
++
++// ============ 3. pw2_residual vs add+mul+add ============
++
++static void bench_pw2_residual(void) {
++    printf("\n--- supertonic_pw2_residual vs add+mul+add (%s) ---\n", g_backend);
++    printf("  %8s %6s | %11s %11s %8s\n", "L", "C", "fused ms", "chain ms", "speedup");
++
++    struct { int L, C; } cases[] = {
++        {1024, 256}, {4096, 512},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C;
++        float * px = fill_rand(L*C, 31 + (unsigned)c);
++        float * pr = fill_rand(L*C, 33 + (unsigned)c);
++        float * pb = fill_rand(C, 35 + (unsigned)c);
++        float * pg = fill_rand(C, 37 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * x  = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * rs = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * bi = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * ga = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * rf = ggml_supertonic_pw2_residual(b.ctx, x, bi, ga, rs);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){x, rs, bi, ga},
++                                 (float *[]){px, pr, pb, pg}, 4);
++
++        bench_begin(&b);
++        x  = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        rs = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        bi = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        ga = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * bib = ggml_repeat(b.ctx, bi, x);
++        struct ggml_tensor * ad1 = ggml_add(b.ctx, x, bib);
++        struct ggml_tensor * gab = ggml_repeat(b.ctx, ga, x);
++        struct ggml_tensor * mu  = ggml_mul(b.ctx, ad1, gab);
++        struct ggml_tensor * rc  = ggml_add(b.ctx, rs, mu);
++        double tc = time_variant(&b, rc, (struct ggml_tensor *[]){x, rs, bi, ga},
++                                 (float *[]){px, pr, pb, pg}, 4);
++
++        char name[64]; snprintf(name, sizeof(name), "pw2_residual %dx%d", L, C);
++        report(name, tf, tc);
++        free(px); free(pr); free(pb); free(pg);
++    }
++}
++
++// ============ 4. affine_prelu vs composed ============
++
++static void bench_affine_prelu(void) {
++    printf("\n--- affine_prelu vs affine+prelu chain (%s) ---\n", g_backend);
++    printf("  %8s %6s %4s | %11s %11s %8s\n", "F", "T", "C", "fused ms", "chain ms", "speedup");
++
++    struct { int F, T, C; } cases[] = {
++        {64, 256, 32}, {128, 512, 64},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int F = cases[c].F, T = cases[c].T, C = cases[c].C;
++        const int FT = F * T;
++        float * px  = fill_rand(FT*C, 41 + (unsigned)c);
++        float * paw = fill_rand(F*C, 43 + (unsigned)c);
++        float * pab = fill_rand(F*C, 45 + (unsigned)c);
++        float * psl = fill_rand(C, 47 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * x  = ggml_new_tensor_3d(b.ctx, GGML_TYPE_F32, F, T, C);
++        struct ggml_tensor * aw = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, F, C);
++        struct ggml_tensor * ab = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, F, C);
++        struct ggml_tensor * sl = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * rf = ggml_affine_prelu(b.ctx, x, aw, ab, sl);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){x, aw, ab, sl},
++                                 (float *[]){px, paw, pab, psl}, 4);
++
++        // composed: affine part x*aw[c,f]+ab[c,f] via repeat on F; prelu via
++        // max(x,0) + slope*min(x,0) then add.
++        bench_begin(&b);
++        x  = ggml_new_tensor_3d(b.ctx, GGML_TYPE_F32, F, T, C);
++        aw = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, F, C);
++        ab = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, F, C);
++        sl = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        // broadcast aw/ab from [F, C] to [F, T, C]: view [F,1,C] -> repeat to [F,T,C]
++        struct ggml_tensor * aw3 = ggml_reshape_3d(b.ctx, aw, F, 1, C);
++        struct ggml_tensor * ab3 = ggml_reshape_3d(b.ctx, ab, F, 1, C);
++        struct ggml_tensor * awb = ggml_repeat(b.ctx, aw3, x);
++        struct ggml_tensor * abb = ggml_repeat(b.ctx, ab3, x);
++        struct ggml_tensor * aff = ggml_add(b.ctx, ggml_mul(b.ctx, x, awb), abb);
++        struct ggml_tensor * pos = ggml_relu(b.ctx, x);
++        struct ggml_tensor * slb = ggml_repeat(b.ctx, sl, x);
++        struct ggml_tensor * neg = ggml_mul(b.ctx, ggml_sub(b.ctx, x, pos), slb);
++        struct ggml_tensor * rc  = ggml_add(b.ctx, aff, neg);
++        double tc = time_variant(&b, rc, (struct ggml_tensor *[]){x, aw, ab, sl},
++                                 (float *[]){px, paw, pab, psl}, 4);
++
++        char name[64]; snprintf(name, sizeof(name), "affine_prelu %dx%dx%d", F, T, C);
++        report(name, tf, tc);
++        free(px); free(paw); free(pab); free(psl);
++    }
++}
++
++// ============ 5. channel_shuffle vs permute/reshape/cont ============
++
++static void bench_channel_shuffle(void) {
++    printf("\n--- channel_shuffle vs view chain (%s) ---\n", g_backend);
++    printf("  %8s %6s %4s %4s | %11s %11s %8s\n", "F", "T", "C", "G", "fused ms", "chain ms", "speedup");
++
++    struct { int F, T, C, G; } cases[] = {
++        {16, 256, 64, 8}, {64, 512, 128, 4},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int F = cases[c].F, T = cases[c].T, C = cases[c].C, G = cases[c].G;
++        const int cg = C / G;
++        float * pa = fill_rand(F*T*C, 51 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * a = ggml_new_tensor_3d(b.ctx, GGML_TYPE_F32, F, T, C);
++        struct ggml_tensor * rf = ggml_channel_shuffle(b.ctx, a, G);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){a},
++                                 (float *[]){pa}, 1);
++
++        // PyTorch channel shuffle over C: [F, T, C] -> reshape [F, T, G, cg]
++        //   -> permute to [F, T, cg, G] -> reshape back [F, T, C] -> cont
++        bench_begin(&b);
++        a = ggml_new_tensor_3d(b.ctx, GGML_TYPE_F32, F, T, C);
++        struct ggml_tensor * rs = ggml_reshape_4d(b.ctx, a, F, T, G, C/G);
++        // want channel c' = (c%G)*cg + c/G: treat C axis split as (G, cg) then
++        // swap to (cg, G) => permutation of dims 2 and 3.
++        struct ggml_tensor * pm = ggml_permute(b.ctx, rs, 0, 1, 3, 2);   // [F, T, cg, G]
++        struct ggml_tensor * ct = ggml_cont(b.ctx, pm);
++        struct ggml_tensor * rc = ggml_reshape_3d(b.ctx, ct, F, T, C);
++        double tc = time_variant(&b, rc, (struct ggml_tensor *[]){a},
++                                 (float *[]){pa}, 1);
++
++        char name[64]; snprintf(name, sizeof(name), "channel_shuffle %dx%d G%d", F*T, C, G);
++        report(name, tf, tc);
++        free(pa);
++    }
++}
++
++// ============ 6. zero_upsample vs upscale(nearest, exact factor) ============
++
++static void bench_zero_upsample(void) {
++    printf("\n--- zero_upsample vs composed zero-insertion (%s) ---\n", g_backend);
++    printf("  %8s %6s %4s | %11s %11s %8s\n", "F", "R", "s", "fused ms", "chain ms", "speedup");
++
++    struct { int F, R, s; } cases[] = {
++        {256, 1, 4}, {1024, 8, 2},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int F = cases[c].F, R = cases[c].R, s = cases[c].s;
++        const int Fu = (F - 1)*s + 1;
++        float * pa = fill_rand(F*R, 61 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * a = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, F, R);
++        struct ggml_tensor * rf = ggml_zero_upsample(b.ctx, a, s);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){a},
++                                 (float *[]){pa}, 1);
++
++        // composed zero-insertion: upscale (nearest) then mask interior
++        // samples to zero via a fixed mask tensor mul.
++        double tc = -1;
++        bench_begin(&b);
++        a = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, F, R);
++        struct ggml_tensor * ups = ggml_upscale(b.ctx, a, s, GGML_SCALE_MODE_NEAREST);
++        struct ggml_tensor * msk = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, F*s, R);
++        struct ggml_tensor * rc  = ggml_mul(b.ctx, ups, msk);
++        float * pm = (float *)calloc((size_t)F*s * R, sizeof(float));
++        for (int r = 0; r < R; r++)
++            for (int f = 0; f < F; f++)
++                pm[f*s + r*(F*s)] = 1.0f;
++
++        if (ggml_backend_supports_op(b.backend, rc) && bench_graph(&b, rc)) {
++            bench_upload(&b, a, pa);
++            bench_upload(&b, msk, pm);
++            tc = bench_time_median(&b);
++        }
++        bench_end(&b);
++        free(pm);
++        char name[64]; snprintf(name, sizeof(name), "zero_upsample %dx%d s%d", F, R, s);
++        report(name, tf, tc);
++        free(pa);
++    }
++}
++
++// ============ 7. supertonic_depthwise_1d vs pad + conv_1d_dw ============
++
++static void bench_supertonic_depthwise(void) {
++    printf("\n--- supertonic_depthwise_1d vs pad+conv_1d_dw+add (%s) ---\n", g_backend);
++    printf("  %8s %6s %4s %4s | %11s %11s %8s\n", "L", "C", "K", "dil", "fused ms", "chain ms", "speedup");
++
++    struct { int L, C, K, dil; } cases[] = {
++        {4096, 64, 7, 1}, {16384, 128, 7, 1},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C, K = cases[c].K, dil = cases[c].dil;
++        const int p0 = (K / 2) * dil;   // symmetric same-padding for the chain
++        float * px = fill_rand(L*C, 71 + (unsigned)c);
++        float * pw = fill_rand(K*C, 73 + (unsigned)c);
++        float * pb = fill_rand(C, 75 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * x = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * w = ggml_new_tensor_3d(b.ctx, GGML_TYPE_F32, K, 1, C);
++        struct ggml_tensor * bi = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * rf = ggml_supertonic_depthwise_1d(b.ctx, x, w, bi, dil);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){x, w, bi},
++                                 (float *[]){px, pw, pb}, 3);
++
++        // composed: conv_1d_dw (with p0) + bias add.  The fused op replaces
++        // im2col+mul_mat+pad+bias with one pass over [L, C].
++        bench_begin(&b);
++        x  = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        w  = ggml_new_tensor_3d(b.ctx, GGML_TYPE_F32, K, 1, C);
++        bi = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * cv  = ggml_conv_1d_dw(b.ctx, w, x, 1, p0, dil);
++        // bias broadcast: cv is [OL, C, 1]
++        struct ggml_tensor * bi3 = ggml_reshape_3d(b.ctx, bi, C, 1, 1);
++        struct ggml_tensor * bib = ggml_repeat(b.ctx, bi3, cv);
++        struct ggml_tensor * rc  = ggml_add(b.ctx, cv, bib);
++        double tc = time_variant(&b, rc, (struct ggml_tensor *[]){x, w, bi},
++                                 (float *[]){px, pw, pb}, 3);
++
++        char name[64]; snprintf(name, sizeof(name), "depthwise_1d %dx%d K%d", L, C, K);
++        report(name, tf, tc);
++        free(px); free(pw); free(pb);
++    }
++}
++
++// ============ 8. supertonic_edge_pad_1d vs concat chain ============
++
++static void bench_supertonic_edge_pad(void) {
++    printf("\n--- supertonic_edge_pad_1d vs concat chain (%s) ---\n", g_backend);
++    printf("  %8s %6s %4s %4s | %11s %11s %8s\n", "L", "C", "pl", "pr", "fused ms", "chain ms", "speedup");
++
++    struct { int L, C, pl, prr; } cases[] = {
++        {4096, 64, 3, 3}, {16384, 128, 7, 7},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C, pl = cases[c].pl, prr = cases[c].prr;
++        float * px = fill_rand(L*C, 81 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * x  = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * rf = ggml_supertonic_edge_pad_1d(b.ctx, x, pl, prr);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){x},
++                                 (float *[]){px}, 1);
++
++        // composed: view first row [1, C] -> repeat pl -> concat with x, then
++        // last row similarly on the right.
++        bench_begin(&b);
++        x = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * first = ggml_view_2d(b.ctx, x, 1, C, x->nb[1], 0);
++        struct ggml_tensor * fr    = ggml_repeat(b.ctx, first, ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, pl, C));
++        struct ggml_tensor * lastv = ggml_view_2d(b.ctx, x, 1, C, x->nb[1], (L-1)*sizeof(float));
++        struct ggml_tensor * lr    = ggml_repeat(b.ctx, lastv, ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, prr, C));
++        struct ggml_tensor * rc    = ggml_concat(b.ctx, ggml_concat(b.ctx, fr, x, 0), lr, 0);
++        double tc = time_variant(&b, rc, (struct ggml_tensor *[]){x},
++                                 (float *[]){px}, 1);
++
++        char name[64]; snprintf(name, sizeof(name), "edge_pad_1d %dx%d p%d/%d", L, C, pl, prr);
++        report(name, tf, tc);
++        free(px);
++    }
++}
++
++// ============ 9. gru (absolute) ============
++
++static void bench_gru(void) {
++    printf("\n--- gru absolute (%s) ---\n", g_backend);
++    printf("  %6s %4s %5s %7s | %11s\n", "H", "B", "L", "rev", "ms");
++
++    struct { int H, B, L, rev; } cases[] = {
++        {64, 1, 256, 0},
++        {128, 8, 128, 0},
++        {256, 1, 64, 1},
++        {512, 4, 32, 1},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int H = cases[c].H, B = cases[c].B, L = cases[c].L, rev = cases[c].rev;
++        float * p_whh = fill_rand(H*3*H, 91 + (unsigned)c);
++        float * p_gi  = fill_rand(3*H*B*L, 93 + (unsigned)c);
++        float * p_bhh = fill_rand(3*H, 95 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * whh = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, H, 3*H);
++        struct ggml_tensor * gi  = ggml_new_tensor_3d(b.ctx, GGML_TYPE_F32, 3*H, B, L);
++        struct ggml_tensor * bhh = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, 3*H);
++        struct ggml_tensor * r   = ggml_gru(b.ctx, whh, gi, bhh, rev != 0);
++        double tf = time_variant(&b, r, (struct ggml_tensor *[]){whh, gi, bhh},
++                                 (float *[]){p_whh, p_gi, p_bhh}, 3);
++
++        if (tf < 0) printf("  H%-5d B%-4d L%-5d r%d    |  SKIP\n", H, B, L, rev);
++        else        printf("  H%-5d B%-4d L%-5d r%d    | %11.4f\n", H, B, L, rev, tf);
++        free(p_whh); free(p_gi); free(p_bhh);
++    }
++}
++
++// ============ 10. supertonic_layer_norm_channel vs permute chain ============
++
++static void bench_supertonic_layer_norm(void) {
++    printf("\n--- supertonic_layer_norm_channel vs permute chain (%s) ---\n", g_backend);
++    printf("  %8s %6s | %11s %11s %8s\n", "L", "C", "fused ms", "chain ms", "speedup");
++
++    struct { int L, C; } cases[] = {
++        {1024, 256}, {4096, 512},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C;
++        const float eps = 1e-5f;
++        float * px = fill_rand(L*C, 101 + (unsigned)c);
++        float * pg = fill_rand(C, 103 + (unsigned)c);
++        float * pb = fill_rand(C, 107 + (unsigned)c);
++
++        struct bench b; bench_begin(&b);
++        struct ggml_tensor * x = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * g = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * bi = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * rf = ggml_supertonic_layer_norm_channel(b.ctx, x, g, bi, eps);
++        double tf = time_variant(&b, rf, (struct ggml_tensor *[]){x, g, bi},
++                                 (float *[]){px, pg, pb}, 3);
++
++        // stock chain: permute to [C, L] (C inner-most) -> norm -> affine -> back
++        bench_begin(&b);
++        x  = ggml_new_tensor_2d(b.ctx, GGML_TYPE_F32, L, C);
++        g  = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        bi = ggml_new_tensor_1d(b.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * pm  = ggml_permute(b.ctx, x, 1, 0, 2, 3);       // [C, L]
++        struct ggml_tensor * cpm = ggml_cont(b.ctx, pm);
++        struct ggml_tensor * nm  = ggml_norm(b.ctx, cpm, eps);               // normalizes ne0 = C
++        struct ggml_tensor * gb  = ggml_repeat(b.ctx, g, nm);
++        struct ggml_tensor * bb  = ggml_repeat(b.ctx, bi, nm);
++        struct ggml_tensor * aff = ggml_add(b.ctx, ggml_mul(b.ctx, nm, gb), bb);
++        struct ggml_tensor * pb2 = ggml_permute(b.ctx, aff, 1, 0, 2, 3);     // back [L, C]
++        struct ggml_tensor * rc  = ggml_cont(b.ctx, pb2);
++        double tc = time_variant(&b, rc, (struct ggml_tensor *[]){x, g, bi},
++                                 (float *[]){px, pg, pb}, 3);
++
++        char name[64]; snprintf(name, sizeof(name), "LN_channel %dx%d", L, C);
++        report(name, tf, tc);
++        free(px); free(pg); free(pb);
++    }
++}
++
++int main(int argc, char ** argv) {
++    setvbuf(stdout, NULL, _IONBF, 0);
++    if (argc > 1) g_backend = argv[1];
++    if (argc > 2) g_threads = atoi(argv[2]);
++    printf("== qvac-ops benchmarks (backend: %s, threads: %d, repeats: %d) ==\n",
++           g_backend, g_threads, g_repeats);
++
++    bench_snake();
++    bench_bias_gelu();
++    bench_pw2_residual();
++    bench_affine_prelu();
++    bench_channel_shuffle();
++    bench_zero_upsample();
++    bench_supertonic_depthwise();
++    bench_supertonic_edge_pad();
++    bench_supertonic_layer_norm();
++    bench_gru();
++
++    printf("\ndone\n");
++    return 0;
++}
+diff --git a/tests-learned/test_qvac_ops.c b/tests-learned/test_qvac_ops.c
+new file mode 100644
+index 0000000..d2f4fbb
+--- /dev/null
++++ b/tests-learned/test_qvac_ops.c
+@@ -0,0 +1,869 @@
++// Smoke tests for the qvac-ops patch (applies on top of the learned-ops patch,
++// ggml v0.19.0 base). Ported from tetherto/qvac-ext-ggml (speech branch, MIT).
++// Verifies, against hand-rolled references:
++//   1. ggml_supertonic_depthwise_1d (+_ct, +_causal_ct) == naive reference
++//   2. ggml_supertonic_layer_norm_channel (+_ct)        == naive reference
++//   3. ggml_supertonic_pw2_residual (+_ct)              == naive reference
++//   4. ggml_supertonic_bias_gelu (+_ct)                 == add + gelu_erf chain
++//   5. ggml_supertonic_edge_pad_1d (+_ct)               == naive reference
++//   6. ggml_gru                                         == naive reference
++//   7. ggml_zero_upsample                               == naive reference
++//   8. ggml_channel_shuffle                             == naive reference
++//   9. ggml_affine_prelu                                == naive reference
++//  10. ggml_snake                                       == naive reference
++//
++// ggml tensors are column-major: element (i0, i1, ...) at i0 + i1*ne0 + ...
++// Usage: test_qvac_ops [cpu|vk]
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#ifdef USE_VULKAN
++ggml_backend_t             ggml_backend_vk_init(size_t dev_num);
++ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
++#endif
++
++static int failures = 0;
++static const char * g_backend = "cpu";
++
++#define CHECK(cond, ...) do { \
++    if (!(cond)) { \
++        printf("  FAIL: " __VA_ARGS__); printf("  (%s:%d)\n", __FILE__, __LINE__); \
++        failures++; \
++    } \
++} while (0)
++
++static bool vec_close_idx(const float * a, const float * b, int n, float tol) {
++    for (int i = 0; i < n; i++) {
++        if (fabsf(a[i] - b[i]) > tol) {
++            printf("    mismatch at %d: %f vs %f\n", i, a[i], b[i]);
++            return false;
++        }
++    }
++    return true;
++}
++
++// per-test-case execution context
++struct tctx {
++    struct ggml_context * ctx;
++    ggml_backend_t backend;
++    ggml_backend_buffer_type_t buft;
++    ggml_gallocr_t galloc;
++    struct ggml_cgraph * gf;
++};
++
++static void tctx_begin(struct tctx * t) {
++    size_t buf_size = 32u*1024u*1024u;
++    struct ggml_init_params ip = { buf_size, NULL, /* no_alloc */ true };
++    t->ctx = ggml_init(ip);
++    t->backend = NULL;
++    t->buft = NULL;
++    t->galloc = NULL;
++    t->gf = NULL;
++#ifdef USE_VULKAN
++    if (strcmp(g_backend, "vk") == 0) {
++        t->backend = ggml_backend_vk_init(0);
++        t->buft = ggml_backend_vk_buffer_type(0);
++        return;
++    }
++#endif
++    t->backend = ggml_backend_cpu_init();
++    t->buft = ggml_backend_cpu_buffer_type();
++}
++
++static bool tctx_alloc_graph(struct tctx * t, struct ggml_tensor * r0,
++                             struct ggml_tensor * r1, struct ggml_tensor * r2) {
++    if (!ggml_backend_supports_op(t->backend, r0)) {
++        printf("  SKIP: %s does not support this op shape\n", g_backend);
++        return false;
++    }
++    t->gf = ggml_new_graph(t->ctx);
++    ggml_build_forward_expand(t->gf, r0);
++    if (r1) ggml_build_forward_expand(t->gf, r1);
++    if (r2) ggml_build_forward_expand(t->gf, r2);
++    t->galloc = ggml_gallocr_new(t->buft);
++    if (!ggml_gallocr_alloc_graph(t->galloc, t->gf)) {
++        printf("  SKIP: galloc failed\n");
++        return false;
++    }
++    return true;
++}
++
++static void tctx_upload(struct tctx * t, struct ggml_tensor * tensor, const void * host) {
++    ggml_backend_tensor_set(tensor, host, 0, ggml_nbytes(tensor));
++}
++
++static void tctx_download(struct tctx * t, const struct ggml_tensor * tensor, void * host) {
++    ggml_backend_tensor_get(tensor, host, 0, ggml_nbytes(tensor));
++}
++
++static void tctx_compute(struct tctx * t) {
++    ggml_backend_graph_compute(t->backend, t->gf);
++}
++
++static void tctx_end(struct tctx * t) {
++    if (t->galloc) ggml_gallocr_free(t->galloc);
++    if (t->backend) ggml_backend_free(t->backend);
++    ggml_free(t->ctx);
++}
++
++static float frand(unsigned * seed) {
++    *seed = *seed * 1103515245u + 12345u;
++    return (float)((*seed >> 16) & 0x7fff) / 16384.0f - 1.0f;
++}
++
++static float gelu_erf_f(float v) {
++    return 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
++}
++
++// ---------- 1. supertonic_depthwise_1d ----------
++// x: [L, C] col-major (element (t,c) at t + c*L).  ct variant: [C, L].
++
++static void test_supertonic_depthwise_1d(void) {
++    printf("[test] supertonic_depthwise_1d / _ct / _causal_ct\n");
++
++    struct { int L, C, K, dil, causal; } cases[] = {
++        {11, 3, 3, 1, 0},
++        {11, 3, 5, 1, 0},
++        {9,  4, 5, 2, 0},
++        {13, 2, 7, 1, 1},
++        {8,  5, 3, 3, 0},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C, K = cases[c].K;
++        const int dil = cases[c].dil, causal = cases[c].causal;
++        unsigned seed = 1234 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * a   = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, L, C);  // [L, C]
++        struct ggml_tensor * act = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, C, L);  // [C, L]
++        struct ggml_tensor * w   = ggml_new_tensor_3d(t.ctx, GGML_TYPE_F32, K, 1, C);
++        struct ggml_tensor * b   = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++
++        struct ggml_tensor * r0 = ggml_supertonic_depthwise_1d(t.ctx, a, w, b, dil);      // [L, C]
++        struct ggml_tensor * r1 = ggml_supertonic_depthwise_1d_ct(t.ctx, act, w, b, dil); // [C, L]
++        struct ggml_tensor * r2 = causal ? ggml_supertonic_depthwise_1d_causal_ct(t.ctx, act, w, b, dil) : NULL;
++
++        CHECK((int)r0->ne[0] == L && (int)r0->ne[1] == C, "shape r0 (case %zu)", c);
++        if (causal) CHECK((int)r2->ne[0] == C && (int)r2->ne[1] == L, "shape r2 (case %zu)", c);
++
++        if (!tctx_alloc_graph(&t, r0, r1, r2)) { tctx_end(&t); continue; }
++
++        const int n_a = L*C, n_w = K*C, n_b = C;
++        float * pa  = (float *)malloc(n_a * sizeof(float));
++        float * pat = (float *)malloc(n_a * sizeof(float));
++        float * pw  = (float *)malloc(n_w * sizeof(float));
++        float * pbb = (float *)malloc(n_b * sizeof(float));
++        for (int ch = 0; ch < C; ch++)
++            for (int tt = 0; tt < L; tt++) {
++                const float v = frand(&seed);
++                pa[tt + ch*L]  = v;   // (t, c) in [L, C]
++                pat[ch + tt*C] = v;   // (c, t) in [C, L]
++            }
++        for (int i = 0; i < n_w; i++) pw[i] = frand(&seed);   // w[k + c*K]
++        for (int i = 0; i < n_b; i++) pbb[i] = frand(&seed);
++
++        tctx_upload(&t, a, pa);
++        tctx_upload(&t, act, pat);
++        tctx_upload(&t, w, pw);
++        tctx_upload(&t, b, pbb);
++        tctx_compute(&t);
++
++        float * o0 = (float *)malloc(ggml_nbytes(r0));
++        float * o1 = (float *)malloc(ggml_nbytes(r1));
++        float * o2 = causal ? (float *)malloc(ggml_nbytes(r2)) : NULL;
++        tctx_download(&t, r0, o0);
++        tctx_download(&t, r1, o1);
++        if (causal) tctx_download(&t, r2, o2);
++
++        const int k_off_c = causal ? -(K - 1) : -(K / 2);   // for r2 (causal_ct)
++        const int k_off_n = -(K / 2);                        // for r0/r1 (symmetric)
++        int pass = 1;
++        for (int ch = 0; ch < C && pass; ch++) {
++            for (int tt = 0; tt < L && pass; tt++) {
++                float sum_n = pbb[ch];
++                float sum_c = pbb[ch];
++                for (int k = 0; k < K; k++) {
++                    int sn = tt + (k + k_off_n) * dil;
++                    if (sn < 0) sn = 0; else if (sn >= L) sn = L - 1;
++                    sum_n += pa[sn + ch*L] * pw[k + ch*K];
++                    if (causal) {
++                        int sc = tt + (k + k_off_c) * dil;
++                        if (sc < 0) sc = 0; else if (sc >= L) sc = L - 1;
++                        sum_c += pa[sc + ch*L] * pw[k + ch*K];
++                    }
++                }
++                if (fabsf(o0[tt + ch*L] - sum_n) > 1e-3f) {
++                    printf("    r0 mismatch case %d t%d c%d: %f vs %f\n", (int)c, tt, ch, o0[tt + ch*L], sum_n);
++                    pass = 0;
++                }
++                if (fabsf(o1[ch + tt*C] - sum_n) > 1e-3f) {
++                    printf("    r1 mismatch case %d t%d c%d: %f vs %f\n", (int)c, tt, ch, o1[ch + tt*C], sum_n);
++                    pass = 0;
++                }
++                if (causal && fabsf(o2[ch + tt*C] - sum_c) > 1e-3f) {
++                    printf("    r2 mismatch case %d t%d c%d: %f vs %f\n", (int)c, tt, ch, o2[ch + tt*C], sum_c);
++                    pass = 0;
++                }
++            }
++        }
++        CHECK(pass, "depthwise_1d mismatch (case %zu L%d C%d K%d dil%d causal%d)",
++              c, L, C, K, dil, causal);
++
++        free(pa); free(pat); free(pw); free(pbb); free(o0); free(o1); free(o2);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 2. supertonic_layer_norm_channel ----------
++
++static void test_supertonic_layer_norm_channel(void) {
++    printf("[test] supertonic_layer_norm_channel / _ct\n");
++
++    struct { int L, C; float eps; } cases[] = {
++        {7, 4, 1e-5f},
++        {16, 8, 1e-6f},
++        {5, 3, 1e-5f},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C;
++        const float eps = cases[c].eps;
++        unsigned seed = 777 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * a   = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * act = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, C, L);
++        struct ggml_tensor * g   = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * b   = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++
++        struct ggml_tensor * r0 = ggml_supertonic_layer_norm_channel(t.ctx, a, g, b, eps);
++        struct ggml_tensor * r1 = ggml_supertonic_layer_norm_channel_ct(t.ctx, act, g, b, eps);
++
++        if (!tctx_alloc_graph(&t, r0, r1, NULL)) { tctx_end(&t); continue; }
++
++        const int n = L*C;
++        float * pa  = (float *)malloc(n * sizeof(float));
++        float * pat = (float *)malloc(n * sizeof(float));
++        float * pg  = (float *)malloc(C * sizeof(float));
++        float * pb  = (float *)malloc(C * sizeof(float));
++        for (int ch = 0; ch < C; ch++)
++            for (int tt = 0; tt < L; tt++) {
++                const float v = frand(&seed) * 3.0f;
++                pa[tt + ch*L]  = v;
++                pat[ch + tt*C] = v;
++            }
++        for (int i = 0; i < C; i++) pg[i] = frand(&seed);
++        for (int i = 0; i < C; i++) pb[i] = frand(&seed);
++
++        tctx_upload(&t, a, pa);
++        tctx_upload(&t, act, pat);
++        tctx_upload(&t, g, pg);
++        tctx_upload(&t, b, pb);
++        tctx_compute(&t);
++
++        float * o0 = (float *)malloc(ggml_nbytes(r0));
++        float * o1 = (float *)malloc(ggml_nbytes(r1));
++        tctx_download(&t, r0, o0);
++        tctx_download(&t, r1, o1);
++
++        int pass = 1;
++        for (int tt = 0; tt < L && pass; tt++) {
++            double mean = 0.0;
++            for (int ch = 0; ch < C; ch++) mean += pa[tt + ch*L];
++            mean /= C;
++            double var = 0.0;
++            for (int ch = 0; ch < C; ch++) {
++                const double d = pa[tt + ch*L] - mean;
++                var += d * d;
++            }
++            const float inv = (float)(1.0 / sqrt(var / C + eps));
++            for (int ch = 0; ch < C; ch++) {
++                const float want = (float)((pa[tt + ch*L] - mean)) * inv * pg[ch] + pb[ch];
++                if (fabsf(o0[tt + ch*L] - want) > 1e-3f || fabsf(o1[ch + tt*C] - want) > 1e-3f) {
++                    printf("    mismatch case %d t%d c%d: %f %f vs %f\n", (int)c, tt, ch,
++                           o0[tt + ch*L], o1[ch + tt*C], want);
++                    pass = 0;
++                }
++            }
++        }
++        CHECK(pass, "layer_norm_channel mismatch (case %zu L%d C%d)", c, L, C);
++
++        free(pa); free(pat); free(pg); free(pb); free(o0); free(o1);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 3. supertonic_pw2_residual ----------
++
++static void test_supertonic_pw2_residual(void) {
++    printf("[test] supertonic_pw2_residual / _ct\n");
++
++    struct { int L, C; } cases[] = { {9, 4}, {5, 7} };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C;
++        unsigned seed = 4242 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * x     = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * xt    = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, C, L);
++        struct ggml_tensor * bias  = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * gamma = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * res   = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * rest  = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, C, L);
++
++        struct ggml_tensor * r0 = ggml_supertonic_pw2_residual(t.ctx, x, bias, gamma, res);
++        struct ggml_tensor * r1 = ggml_supertonic_pw2_residual_ct(t.ctx, xt, bias, gamma, rest);
++
++        if (!tctx_alloc_graph(&t, r0, r1, NULL)) { tctx_end(&t); continue; }
++
++        const int n = L*C;
++        float * px    = (float *)malloc(n * sizeof(float));
++        float * pxt   = (float *)malloc(n * sizeof(float));
++        float * pr    = (float *)malloc(n * sizeof(float));
++        float * prt   = (float *)malloc(n * sizeof(float));
++        float * pb    = (float *)malloc(C * sizeof(float));
++        float * pg    = (float *)malloc(C * sizeof(float));
++        for (int ch = 0; ch < C; ch++)
++            for (int tt = 0; tt < L; tt++) {
++                const float vx = frand(&seed);
++                const float vr = frand(&seed);
++                px[tt + ch*L]   = vx;  pxt[ch + tt*C] = vx;
++                pr[tt + ch*L]   = vr;  prt[ch + tt*C] = vr;
++            }
++        for (int i = 0; i < C; i++) pb[i] = frand(&seed);
++        for (int i = 0; i < C; i++) pg[i] = frand(&seed);
++
++        tctx_upload(&t, x, px);
++        tctx_upload(&t, xt, pxt);
++        tctx_upload(&t, res, pr);
++        tctx_upload(&t, rest, prt);
++        tctx_upload(&t, bias, pb);
++        tctx_upload(&t, gamma, pg);
++        tctx_compute(&t);
++
++        float * o0 = (float *)malloc(ggml_nbytes(r0));
++        float * o1 = (float *)malloc(ggml_nbytes(r1));
++        tctx_download(&t, r0, o0);
++        tctx_download(&t, r1, o1);
++
++        int pass = 1;
++        for (int tt = 0; tt < L && pass; tt++) {
++            for (int ch = 0; ch < C && pass; ch++) {
++                const float want = pr[tt + ch*L] + (px[tt + ch*L] + pb[ch]) * pg[ch];
++                if (fabsf(o0[tt + ch*L] - want) > 1e-4f || fabsf(o1[ch + tt*C] - want) > 1e-4f) {
++                    printf("    mismatch case %d t%d c%d: %f %f vs %f\n", (int)c, tt, ch,
++                           o0[tt + ch*L], o1[ch + tt*C], want);
++                    pass = 0;
++                }
++            }
++        }
++        CHECK(pass, "pw2_residual mismatch (case %zu L%d C%d)", c, L, C);
++
++        free(px); free(pxt); free(pr); free(prt); free(pb); free(pg); free(o0); free(o1);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 4. supertonic_bias_gelu ----------
++
++static void test_supertonic_bias_gelu(void) {
++    printf("[test] supertonic_bias_gelu / _ct\n");
++
++    struct { int L, C; } cases[] = { {9, 4}, {16, 3} };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C;
++        unsigned seed = 99 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * x    = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * xt   = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, C, L);
++        struct ggml_tensor * bias = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++
++        struct ggml_tensor * r0 = ggml_supertonic_bias_gelu(t.ctx, x, bias);
++        struct ggml_tensor * r1 = ggml_supertonic_bias_gelu_ct(t.ctx, xt, bias);
++
++        if (!tctx_alloc_graph(&t, r0, r1, NULL)) { tctx_end(&t); continue; }
++
++        const int n = L*C;
++        float * px  = (float *)malloc(n * sizeof(float));
++        float * pxt = (float *)malloc(n * sizeof(float));
++        float * pb  = (float *)malloc(C * sizeof(float));
++        for (int ch = 0; ch < C; ch++)
++            for (int tt = 0; tt < L; tt++) {
++                const float v = frand(&seed) * 4.0f;
++                px[tt + ch*L]  = v;
++                pxt[ch + tt*C] = v;
++            }
++        for (int i = 0; i < C; i++) pb[i] = frand(&seed);
++
++        tctx_upload(&t, x, px);
++        tctx_upload(&t, xt, pxt);
++        tctx_upload(&t, bias, pb);
++        tctx_compute(&t);
++
++        float * o0 = (float *)malloc(ggml_nbytes(r0));
++        float * o1 = (float *)malloc(ggml_nbytes(r1));
++        tctx_download(&t, r0, o0);
++        tctx_download(&t, r1, o1);
++
++        int pass = 1;
++        for (int tt = 0; tt < L && pass; tt++) {
++            for (int ch = 0; ch < C && pass; ch++) {
++                const float want = gelu_erf_f(px[tt + ch*L] + pb[ch]);
++                if (fabsf(o0[tt + ch*L] - want) > 1e-4f || fabsf(o1[ch + tt*C] - want) > 1e-4f) {
++                    printf("    mismatch case %d t%d c%d: %f %f vs %f\n", (int)c, tt, ch,
++                           o0[tt + ch*L], o1[ch + tt*C], want);
++                    pass = 0;
++                }
++            }
++        }
++        CHECK(pass, "bias_gelu mismatch (case %zu L%d C%d)", c, L, C);
++
++        free(px); free(pxt); free(pb); free(o0); free(o1);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 5. supertonic_edge_pad_1d ----------
++
++static void test_supertonic_edge_pad_1d(void) {
++    printf("[test] supertonic_edge_pad_1d / _ct\n");
++
++    struct { int L, C, pl, prr; } cases[] = {
++        {8, 3, 2, 2},
++        {8, 3, 3, 0},
++        {5, 4, 0, 2},
++        {4, 2, 5, 5},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int L = cases[c].L, C = cases[c].C, pl = cases[c].pl, prr = cases[c].prr;
++        const int LO = L + pl + prr;
++        unsigned seed = 555 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * x  = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, L, C);
++        struct ggml_tensor * xt = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, C, L);
++
++        struct ggml_tensor * r0 = ggml_supertonic_edge_pad_1d(t.ctx, x, pl, prr);   // [LO, C]
++        struct ggml_tensor * r1 = ggml_supertonic_edge_pad_1d_ct(t.ctx, xt, pl, prr); // [C, LO]
++
++        CHECK((int)r0->ne[0] == LO && (int)r0->ne[1] == C, "shape r0 (case %zu)", c);
++        CHECK((int)r1->ne[0] == C && (int)r1->ne[1] == LO, "shape r1 (case %zu)", c);
++
++        if (!tctx_alloc_graph(&t, r0, r1, NULL)) { tctx_end(&t); continue; }
++
++        const int n = L*C;
++        float * px  = (float *)malloc(n * sizeof(float));
++        float * pxt = (float *)malloc(n * sizeof(float));
++        for (int ch = 0; ch < C; ch++)
++            for (int tt = 0; tt < L; tt++) {
++                const float v = frand(&seed);
++                px[tt + ch*L]  = v;
++                pxt[ch + tt*C] = v;
++            }
++
++        tctx_upload(&t, x, px);
++        tctx_upload(&t, xt, pxt);
++        tctx_compute(&t);
++
++        float * o0 = (float *)malloc(LO*C * sizeof(float));
++        float * o1 = (float *)malloc(LO*C * sizeof(float));
++        tctx_download(&t, r0, o0);
++        tctx_download(&t, r1, o1);
++
++        int pass = 1;
++        for (int ch = 0; ch < C && pass; ch++) {
++            for (int tt = 0; tt < LO && pass; tt++) {
++                int s = tt - pl;
++                if (s < 0) s = 0;
++                if (s >= L) s = L - 1;
++                const float want = px[s + ch*L];
++                if (fabsf(o0[tt + ch*LO] - want) > 1e-6f || fabsf(o1[ch + tt*C] - want) > 1e-6f) {
++                    printf("    mismatch case %d t%d c%d: %f %f vs %f\n", (int)c, tt, ch,
++                           o0[tt + ch*LO], o1[ch + tt*C], want);
++                    pass = 0;
++                }
++            }
++        }
++        CHECK(pass, "edge_pad_1d mismatch (case %zu L%d C%d pl%d pr%d)", c, L, C, pl, prr);
++
++        free(px); free(pxt); free(o0); free(o1);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 6. gru ----------
++
++static void test_gru(void) {
++    printf("[test] gru (forward + reverse)\n");
++
++    struct { int H, B, L; int rev; } cases[] = {
++        {4, 1, 6, 0},
++        {4, 3, 6, 0},
++        {8, 2, 5, 1},
++        {16, 2, 4, 0},
++        {2, 4, 7, 1},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int H = cases[c].H, B = cases[c].B, L = cases[c].L, rev = cases[c].rev;
++        unsigned seed = 31337 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * whh = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, H, 3*H);  // [H, 3H]
++        struct ggml_tensor * gi  = ggml_new_tensor_3d(t.ctx, GGML_TYPE_F32, 3*H, B, L);
++        struct ggml_tensor * bhh = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, 3*H);
++
++        struct ggml_tensor * r = ggml_gru(t.ctx, whh, gi, bhh, rev != 0);
++
++        CHECK((int)r->ne[0] == H && (int)r->ne[1] == B && (int)r->ne[2] == L, "shape (case %zu)", c);
++
++        if (!tctx_alloc_graph(&t, r, NULL, NULL)) { tctx_end(&t); continue; }
++
++        const int n_whh = H*3*H, n_gi = 3*H*B*L, n_bhh = 3*H;
++        float * p_whh = (float *)malloc(n_whh * sizeof(float));
++        float * p_gi  = (float *)malloc(n_gi * sizeof(float));
++        float * p_bhh = (float *)malloc(n_bhh * sizeof(float));
++        for (int i = 0; i < n_whh; i++) p_whh[i] = frand(&seed);
++        for (int i = 0; i < n_gi; i++) p_gi[i] = frand(&seed);
++        for (int i = 0; i < n_bhh; i++) p_bhh[i] = frand(&seed);
++
++        tctx_upload(&t, whh, p_whh);
++        tctx_upload(&t, gi, p_gi);
++        tctx_upload(&t, bhh, p_bhh);
++        tctx_compute(&t);
++
++        float * out = (float *)malloc(ggml_nbytes(r));
++        tctx_download(&t, r, out);
++
++        // reference: serial over time, parallel over batch.  PyTorch GRU semantics:
++        //   gh[g] = sum_k whh[k + g*H] * h[k] + bhh[g]   (whh [H, 3H] col-major)
++        //   r = sigmoid(gi[r] + gh[r]); z = sigmoid(gi[z] + gh[z]); n = tanh(gi[n] + r*gh[n])
++        //   h' = n + z*(h - n)
++        float * h = (float *)calloc(H, sizeof(float));
++        float * gh = (float *)calloc(3*H, sizeof(float));
++        int pass = 1;
++        for (int b = 0; b < B && pass; b++) {
++            memset(h, 0, H * sizeof(float));
++            for (int s = 0; s < L && pass; s++) {
++                const int tt = rev ? (L - 1 - s) : s;
++                const float * gip = p_gi + ((size_t)3*H*b + (size_t)3*H*B*tt);
++                for (int g = 0; g < 3*H; g++) {
++                    float acc = 0.0f;
++                    for (int k = 0; k < H; k++) acc += p_whh[k + (size_t)H*g] * h[k];
++                    gh[g] = acc + p_bhh[g];
++                }
++                for (int j = 0; j < H; j++) {
++                    const float rr = 1.0f/(1.0f + expf(-(gip[j] + gh[j])));
++                    const float zz = 1.0f/(1.0f + expf(-(gip[H + j] + gh[H + j])));
++                    const float nn = tanhf(gip[2*H + j] + rr*gh[2*H + j]);
++                    h[j] = nn + zz*(h[j] - nn);
++                    const float got = out[(size_t)H*b + (size_t)H*B*tt + j];
++                    if (fabsf(got - h[j]) > 2e-3f) {
++                        printf("    mismatch case %d b%d t%d j%d: %f vs %f\n", (int)c, b, tt, j, got, h[j]);
++                        pass = 0;
++                    }
++                }
++            }
++        }
++        CHECK(pass, "gru mismatch (case %zu H%d B%d L%d rev%d)", c, H, B, L, rev);
++        free(h); free(gh);
++
++        free(p_whh); free(p_gi); free(p_bhh); free(out);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 7. zero_upsample ----------
++
++static void test_zero_upsample(void) {
++    printf("[test] zero_upsample\n");
++
++    struct { int F, R, s; } cases[] = {
++        {5, 1, 2},
++        {5, 3, 3},
++        {1, 2, 4},
++        {9, 2, 2},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int F = cases[c].F, R = cases[c].R, s = cases[c].s;
++        const int Fu = (F - 1)*s + 1;
++        unsigned seed = 2024 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * a = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, F, R);
++        struct ggml_tensor * r = ggml_zero_upsample(t.ctx, a, s);
++
++        CHECK((int)r->ne[0] == Fu && (int)r->ne[1] == R, "shape (case %zu)", c);
++
++        if (!tctx_alloc_graph(&t, r, NULL, NULL)) { tctx_end(&t); continue; }
++
++        const int n = F*R;
++        float * pa = (float *)malloc(n * sizeof(float));
++        for (int i = 0; i < n; i++) pa[i] = frand(&seed);
++        tctx_upload(&t, a, pa);
++        tctx_compute(&t);
++
++        float * out = (float *)malloc(ggml_nbytes(r));
++        tctx_download(&t, r, out);
++
++        int pass = 1;
++        for (int rr = 0; rr < R && pass; rr++) {
++            for (int f = 0; f < Fu && pass; f++) {
++                const float want = (f % s == 0) ? pa[f/s + rr*F] : 0.0f;
++                if (fabsf(out[f + rr*Fu] - want) > 1e-6f) {
++                    printf("    mismatch case %d r%d f%d: %f vs %f\n", (int)c, rr, f, out[f + rr*Fu], want);
++                    pass = 0;
++                }
++            }
++        }
++        CHECK(pass, "zero_upsample mismatch (case %zu F%d R%d s%d)", c, F, R, s);
++
++        free(pa); free(out);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 8. channel_shuffle ----------
++
++static void test_channel_shuffle(void) {
++    printf("[test] channel_shuffle\n");
++
++    struct { int F, T, C, Bc, G; } cases[] = {
++        {3, 4, 6, 1, 2},
++        {3, 4, 6, 2, 3},
++        {2, 2, 4, 1, 4},
++        {5, 2, 8, 2, 2},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int F = cases[c].F, T = cases[c].T, C = cases[c].C, Bc = cases[c].Bc, G = cases[c].G;
++        const int FT = F*T;
++        unsigned seed = 606 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * a = ggml_new_tensor_4d(t.ctx, GGML_TYPE_F32, F, T, C, Bc);
++        struct ggml_tensor * r = ggml_channel_shuffle(t.ctx, a, G);
++
++        if (!tctx_alloc_graph(&t, r, NULL, NULL)) { tctx_end(&t); continue; }
++
++        const int n = FT*C*Bc;
++        float * pa = (float *)malloc(n * sizeof(float));
++        for (int i = 0; i < n; i++) pa[i] = frand(&seed);
++        tctx_upload(&t, a, pa);
++        tctx_compute(&t);
++
++        float * out = (float *)malloc(ggml_nbytes(r));
++        tctx_download(&t, r, out);
++
++        const int cg = C / G;
++        int pass = 1;
++        for (int cp = 0; cp < C && pass; cp++) {
++            const int in_c = (cp % G) * cg + cp / G;
++            for (int b = 0; b < Bc && pass; b++) {
++                for (int i = 0; i < FT && pass; i++) {
++                    const float want = pa[(in_c + C*b)*FT + i];
++                    const float got = out[(cp + C*b)*FT + i];
++                    if (fabsf(got - want) > 1e-6f) {
++                        printf("    mismatch case %d cp%d b%d i%d: %f vs %f\n", (int)c, cp, b, i, got, want);
++                        pass = 0;
++                    }
++                }
++            }
++        }
++        CHECK(pass, "channel_shuffle mismatch (case %zu C%d G%d)", c, C, G);
++
++        free(pa); free(out);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 9. affine_prelu ----------
++
++static void test_affine_prelu(void) {
++    printf("[test] affine_prelu\n");
++
++    struct { int F, T, C, Bc; } cases[] = {
++        {4, 5, 3, 1},
++        {4, 5, 3, 2},
++        {2, 3, 5, 1},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int F = cases[c].F, T = cases[c].T, C = cases[c].C, Bc = cases[c].Bc;
++        const int FT = F*T;
++        unsigned seed = 808 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * x     = ggml_new_tensor_4d(t.ctx, GGML_TYPE_F32, F, T, C, Bc);
++        struct ggml_tensor * aw    = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, F, C);
++        struct ggml_tensor * ab    = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, F, C);
++        struct ggml_tensor * slope = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++
++        struct ggml_tensor * r = ggml_affine_prelu(t.ctx, x, aw, ab, slope);
++
++        if (!tctx_alloc_graph(&t, r, NULL, NULL)) { tctx_end(&t); continue; }
++
++        const int n = FT*C*Bc;
++        float * px  = (float *)malloc(n * sizeof(float));
++        float * paw = (float *)malloc(F*C * sizeof(float));
++        float * pab = (float *)malloc(F*C * sizeof(float));
++        float * psl = (float *)malloc(C * sizeof(float));
++        for (int i = 0; i < n; i++) px[i] = frand(&seed) * 2.0f;
++        for (int i = 0; i < F*C; i++) paw[i] = frand(&seed);
++        for (int i = 0; i < F*C; i++) pab[i] = frand(&seed);
++        for (int i = 0; i < C; i++) psl[i] = frand(&seed);
++
++        tctx_upload(&t, x, px);
++        tctx_upload(&t, aw, paw);
++        tctx_upload(&t, ab, pab);
++        tctx_upload(&t, slope, psl);
++        tctx_compute(&t);
++
++        float * out = (float *)malloc(ggml_nbytes(r));
++        tctx_download(&t, r, out);
++
++        int pass = 1;
++        for (int p = 0; p < C*Bc && pass; p++) {
++            const int ch = p % C;
++            for (int i = 0; i < FT && pass; i++) {
++                const float xv = px[p*FT + i];
++                const float rv = xv > 0.0f ? xv : 0.0f;
++                const float want = xv * paw[ch*F + (i % F)] + pab[ch*F + (i % F)]
++                                 + rv + psl[ch] * (xv - rv);
++                if (fabsf(out[p*FT + i] - want) > 1e-4f) {
++                    printf("    mismatch case %d p%d i%d: %f vs %f\n", (int)c, p, i, out[p*FT + i], want);
++                    pass = 0;
++                }
++            }
++        }
++        CHECK(pass, "affine_prelu mismatch (case %zu C%d Bc%d)", c, C, Bc);
++
++        free(px); free(paw); free(pab); free(psl); free(out);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 10. snake ----------
++
++static void test_snake(void) {
++    printf("[test] snake\n");
++
++    struct { int T, C; } cases[] = { {16, 4}, {5, 8} };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int T = cases[c].T, C = cases[c].C;
++        unsigned seed = 909 + (unsigned)c;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * x  = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, T, C);
++        struct ggml_tensor * a  = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++        struct ggml_tensor * ib = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, C);
++
++        struct ggml_tensor * r = ggml_snake(t.ctx, x, a, ib);
++
++        if (!tctx_alloc_graph(&t, r, NULL, NULL)) { tctx_end(&t); continue; }
++
++        const int n = T*C;
++        float * px  = (float *)malloc(n * sizeof(float));
++        float * pa  = (float *)malloc(C * sizeof(float));
++        float * pib = (float *)malloc(C * sizeof(float));
++        for (int i = 0; i < n; i++) px[i] = frand(&seed) * 3.0f;
++        for (int i = 0; i < C; i++) pa[i] = frand(&seed);
++        for (int i = 0; i < C; i++) pib[i] = frand(&seed);
++
++        tctx_upload(&t, x, px);
++        tctx_upload(&t, a, pa);
++        tctx_upload(&t, ib, pib);
++        tctx_compute(&t);
++
++        float * out = (float *)malloc(ggml_nbytes(r));
++        tctx_download(&t, r, out);
++
++        int pass = 1;
++        for (int ch = 0; ch < C && pass; ch++) {
++            for (int tt = 0; tt < T && pass; tt++) {
++                const float xi = px[tt + ch*T];
++                const float si = sinf(pa[ch] * xi);
++                const float want = xi + si*si*pib[ch];
++                if (fabsf(out[tt + ch*T] - want) > 1e-4f) {
++                    printf("    mismatch case %d t%d c%d: %f vs %f\n", (int)c, tt, ch, out[tt + ch*T], want);
++                    pass = 0;
++                }
++            }
++        }
++        CHECK(pass, "snake mismatch (case %zu T%d C%d)", c, T, C);
++
++        free(px); free(pa); free(pib); free(out);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++int main(int argc, char ** argv) {
++    setvbuf(stdout, NULL, _IONBF, 0);
++    if (argc > 1) {
++        g_backend = argv[1];
++    }
++    printf("== qvac-ops smoke tests (backend: %s) ==\n", g_backend);
++
++    test_supertonic_depthwise_1d();
++    test_supertonic_layer_norm_channel();
++    test_supertonic_pw2_residual();
++    test_supertonic_bias_gelu();
++    test_supertonic_edge_pad_1d();
++    test_gru();
++    test_zero_upsample();
++    test_channel_shuffle();
++    test_affine_prelu();
++    test_snake();
++
++    if (failures == 0) {
++        printf("\nALL PASSED\n");
++        return 0;
++    }
++    printf("\n%d FAILURES\n", failures);
++    return 1;
++}

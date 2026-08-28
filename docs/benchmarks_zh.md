@@ -103,3 +103,79 @@
 3. **亚毫秒级 GPU kernel 的单次比值噪声可达 ±50%**——CUDA convT 的 0.45×↔0.98× 与 conv small 的 0.63×↔1.76× 都是同一现象。结论一律基于多轮运行的稳定趋势，不以单次为准。
 4. legacy convT 断言要求 `g=1, p=0, op=0`，不满足的 shape 只能由 ext 一侧运行（表中 legacy 列标 "–"）。
 5. scatter 的 builder 约束 `updates->ne[d] == data->ne[d]（d ≠ axis）`，不合法组合会被断言拒绝。
+
+---
+
+# 补丁二：十个 qvac 融合算子
+
+由 `tests/bench_qvac_ops.c` 产出（`fused` = 新的单分发算子；`composed` = 等价的原版 ggml 子图；`speedup = composed / fused`）。硬件同上（RTX 2070、8 线程 CPU、MSVC 2019 AVX2），ggml v0.19.0 + 两个补丁。**20 次计时取中位数**（3 次热身）——补丁一用的是均值，本组亚毫秒 case 要求中位数。
+
+## 融合 vs 组合（CPU，8 线程）
+
+| case | fused ms | composed ms | speedup |
+|---|---|---|---|
+| snake 2048×64 | 0.410 | 1.350 | **3.29×** |
+| snake 8192×128 | 2.195 | 4.840 | **2.20×** |
+| snake 32768×32 | 1.252 | 5.705 | **4.56×** |
+| bias_gelu 1024×256 | 0.816 | 1.182 | 1.45× |
+| bias_gelu 4096×512 | 6.113 | 10.588 | **1.73×** |
+| bias_gelu 1024×1024 | 2.027 | 3.696 | 1.82× |
+| pw2_residual 1024×256 | 0.061 | 0.568 | **9.37×** |
+| pw2_residual 4096×512 | 0.460 | 4.348 | **9.46×** |
+| affine_prelu 64×256×32 | 1.563 | 2.866 | 1.83× |
+| affine_prelu 128×512×64 | 12.528 | 20.091 | 1.60× |
+| channel_shuffle 4096×64 G8 | 0.055 | 0.047 | 0.85× |
+| channel_shuffle 32768×128 G4 | 0.741 | 0.588 | 0.79× |
+| zero_upsample 256×1 s4 | 0.009 | 0.026 | 2.78× |
+| zero_upsample 1024×8 s2 | 0.010 | 0.141 | **14.87×** |
+| depthwise_1d 4096×64 K7 | 0.739 | 21.907 | **29.64×** |
+| depthwise_1d 16384×128 K7 | 10.029 | 192.425 | **19.19×** |
+| edge_pad_1d 4096×64 p3/3 | 0.151 | 2.039 | **13.51×** |
+| edge_pad_1d 16384×128 p7/7 | 1.189 | 15.206 | **12.79×** |
+| LN_channel 1024×256 | 0.689 | 1.813 | **2.63×** |
+| LN_channel 4096×512 | 15.457 | 12.852 | 0.83× |
+
+（跑了第二轮交叉核对；除 <0.05 ms 的行外，重复性在 ±10% 内。）
+
+### CPU 读数
+
+- **两个 im2col 类融合最猛**：`depthwise_1d`（19–30×）与 `edge_pad_1d`（13×）分别消灭了 F16 im2col scratch 张量和 concat/repeat 拷贝。
+- **节点数主导的融合给 2.5–15×**：`pw2_residual`、`zero_upsample`、`snake`——各省掉 2–4 次 kernel 分发。
+- **本机上的诚实回退**：`channel_shuffle`（0.79–0.85×）——组合 view 链在连续平面上编译成大 `memcpy`，跑赢了逐平面 gather；`LN_channel` 在 C=512（0.83×）——原版链的 permute 给向量化更友好的最内层 stride。两者在 GPU 分发次数上、以及引擎实际使用的 `[C,T]` 布局上仍是赢家。
+
+## 融合 vs 组合（Vulkan，RTX 2070）
+
+| case | fused ms | composed ms | speedup |
+|---|---|---|---|
+| snake 2048×64 | 0.109 | 0.180 | 1.65× |
+| snake 8192×128 | 0.126 | 0.480 | **3.81×** |
+| snake 32768×32 | 0.127 | 0.493 | **3.89×** |
+| affine_prelu 64×256×32 | 0.123 | 0.431 | **3.51×** |
+| affine_prelu 128×512×64 | 0.276–0.291 | 1.739–1.752 | **6.0–6.3×** |
+| channel_shuffle 4096×64 G8 | 0.118 | 0.129 | 1.09× |
+| channel_shuffle 32768×128 G4 | 0.285 | 0.229 | 0.80× |
+| zero_upsample 256×1 s4 | 0.147 | 0.136 | 0.93× |
+| zero_upsample 1024×8 s2 | 0.106 | 0.142 | 1.34× |
+| pw2_residual / bias_gelu / depthwise / edge_pad / LN | — | 已测 | fused 未移植 Vulkan（回落 CPU；上游 qvac 为 Metal 内核） |
+
+五个 Vulkan shader 算子符合设计预期：`snake` 与 `affine_prelu`——两个替代"多 kernel 广播链"的——拿到真实 GPU 收益（最高 3.9× 与 6.3×）；拷贝类（`channel_shuffle`、`zero_upsample`）在 GPU 上组合链本就融为单次拷贝，比值在 1.0 附近。
+
+## `GRU`（绝对性能；原版无对应实现）
+
+| 后端 | H | B | L | reverse | ms |
+|---|---|---|---|---|---|
+| CPU | 64 | 1 | 256 | 否 | 4.93 |
+| CPU | 128 | 8 | 128 | 否 | 11.11 |
+| CPU | 256 | 1 | 64 | 是 | 19.58 |
+| CPU | 512 | 4 | 32 | 是 | 47.29 |
+| Vulkan (RTX 2070) | 64 | 1 | 256 | 否 | 2.23 |
+| Vulkan | 128 | 8 | 128 | 否 | 4.27 |
+| Vulkan | H ≥ 256 | | | | SKIP（H ≤ 128 共享内存上限；回落 CPU） |
+
+原版 ggml 没有 RNN 单元——对照列就是这一行的**存在本身**。Vulkan 打包内核（128 lane = 每 workgroup `128/H` 个 batch 元素）在 H ≤ 128 时约为 CPU 的 2×。
+
+## 补丁二方法论备注
+
+6. 挂具规则同补丁一（每变体独立 backend + galloc、不走 sched）。Vulkan 的"每变体独立生命周期"要求再次得到确认：跨图形状复用 subcontext 会崩。
+7. Vulkan 上的 `snake` 复用原版 `snake_f32` pipeline（v0.19 基线自带图级 snake 融合、数学一致），fused 列测的是 **op 分发路径**而非新 shader。
+8. Vulkan/CPU 上 `channel_shuffle` 的组合链已接近最优单拷贝——speedup < 1 应读作"无收益空间"，不是缺陷。

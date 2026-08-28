@@ -90,3 +90,32 @@ vk_device members / pipeline members / push-constants struct
 - In v0.19, `ggml_backend_alloc_ctx_tensors_from_buft` is not public; tests use a graph allocator for intermediates plus a no-alloc context for graph construction.
 - The multi-backend `ggml_backend_sched` requires the last backend in the list to be CPU; on this baseline a {GPU, CPU} sched running mixed-op graphs showed allocation anomalies (mul_mat and im2col outputs sharing a buffer, nodes apparently skipped) — the test suite sidesteps this with **galloc + single-backend graph_compute**, which is also llama.cpp's mainstream single-GPU path.
 - On Windows, if a test binary can crash mid-run, add `setvbuf(stdout, NULL, _IONBF, 0)` at the top of `main()` — otherwise a crash silently discards everything still buffered.
+
+---
+
+# Patch 2 porting notes (qvac ops)
+
+Porting a *batch* of ten ops from one donor tree (tetherto/qvac-ext-ggml, `speech` branch) onto an older baseline (v0.19.0) surfaced new failure classes beyond patch 1's single-op lessons:
+
+## 7. Donor-vs-baseline drift
+
+- **The donor tree is newer than the target baseline.** qvac's ggml is a v0.20-era dlopen-variant tree (760 files differ). Never copy whole files; port each op as a diff of insertion points. Enums land in a different numeric range (donor `GGML_OP_COUNT` = 107, baseline starts at 104 pre-patch-1) — update **both** `static_assert(GGML_OP_COUNT == N)` sites in `ggml.c`, not one.
+- **Check what the baseline already has before porting.** The v0.19 baseline already shipped a *graph-level* snake fusion in its Vulkan backend (`snake_pattern` = mul→sin→sqr→mul→add, plus a `snake_f32` pipeline and `snake.comp`). Naively following the donor produced duplicate `vk_op_snake_push_constants`, a duplicate `pipeline_snake_f32` member and a second `string_to_spv("snake_f32", ...)` — redefinition errors plus a pipeline-name clash. The fix: **reuse the upstream pipeline** (its math and binding layout `{x, a, inv_b, dst}` are identical to the donor's) and delete every duplicate registration. Rule: before porting op X, `git grep -i x` the baseline for names that will collide (shader names, push-constant structs, pipeline members, `string_to_spv` keys).
+- **COL2IM_1D and ROLL already existed upstream** in v0.19 — the donor's versions of those builders/kernels must *not* be ported. Only ops missing from the target's enum get ported.
+
+## 8. Vulkan re-registration checklist (per op)
+
+For each new op, all of these must be touched or the build fails or dispatch falls over: push-constant struct → pipeline member → `ggml_vk_create_pipeline` (matching `parameter_count`, `wg_denoms`) → `vulkan-shaders-gen.cpp` `string_to_spv` → `ggml_vk_op_get_pipeline` case → `elements` case in `ggml_vk_op_f32` → dispatch wrapper → graph-compute switch case → `supports_op` → (debug-only) `vk_check_results` clone chain. The `elements` convention note from patch 1 generalizes: the generic unary group computes a flat 512×512 split; a shader that indexes 2-D (`i0 + i1*ne0`) needs its own `elements = {ne0, ne1, 1}` case instead of joining that group.
+
+## 9. Column-major test traps
+
+- The CPU kernels from the donor index buffers in **ggml column-major** (`x[t + c*L]` for a `[L, C]` tensor). A reference written in row-major (`x[t*C + c]`) compiles fine, runs fine, and fails everywhere. Symptom: every case off by "some other element's value", not by magnitude. Fix the test's indexing, not the kernel.
+- A multi-result test (layout-0 vs layout-1 variants of the same op) must expand **every result root** into the forward graph — `ggml_build_forward_expand` only pulls in what is reachable from the roots you pass. A tensor built but not passed as a root (or reachable from one) gets **no buffer** from the graph allocator, and the first `tensor_set` on it dies with `GGML_ASSERT(buf != NULL && "tensor buffer not set")`. With three variants (`_1d`, `_ct`, `_causal_ct`) all three roots must be expanded even though the causal one is `NULL` in non-causal cases.
+
+## 10. PowerShell patch-generation trap
+
+`git diff > file` from PowerShell 5.1 writes **UTF-16 LE** (the BOM `FF FE` makes `git apply` report "No valid patches in input"). Generate diffs via `cmd /c "git diff ... > file"` or `git diff --output=file`, then verify the first bytes are ASCII `d i f f`.
+
+## 11. ggml_pad is per-dimension, not per-side
+
+Composing comparison graphs against the fused depthwise op: `ggml_pad(x, p0, p0, 0, 0)` adds `p0` **to each of ne0 and ne1** (per-dimension sizes), not `p0` on each side of `ne0`. A same-padding 1-D conv chain should just use `ggml_conv_1d_dw(w, x, s, p0, d)` — the builder takes padding directly — rather than an explicit pad. (An explicit symmetric pad is `ggml_pad(x, 2*p0, 0, 0, 0)`.)
