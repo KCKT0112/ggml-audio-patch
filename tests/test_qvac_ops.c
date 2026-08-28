@@ -13,7 +13,12 @@
 //  10. ggml_snake                                       == naive reference
 //
 // ggml tensors are column-major: element (i0, i1, ...) at i0 + i1*ne0 + ...
-// Usage: test_qvac_ops [cpu|vk]
+// Usage: test_qvac_ops [cpu|vk|metal]
+//   metal requires -DUSE_METAL and a macOS build linking ggml-metal; it is
+//   the harness hook for the Metal porting procedure (docs/metal-porting.md
+//   in the ggml-audio-patch repo).  With patch 2 as shipped, Metal supports_op
+//   returns false for all ten ops, so every case SKIPs until the integrator
+//   enables gates per docs/metal-porting.md.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +33,10 @@
 #ifdef USE_VULKAN
 ggml_backend_t             ggml_backend_vk_init(size_t dev_num);
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
+#endif
+#ifdef USE_METAL
+// generic device API: "Metal" device -> buffer type (ggml-backend.h)
+ggml_backend_t ggml_backend_metal_init(void);
 #endif
 
 static int failures = 0;
@@ -71,6 +80,15 @@ static void tctx_begin(struct tctx * t) {
     if (strcmp(g_backend, "vk") == 0) {
         t->backend = ggml_backend_vk_init(0);
         t->buft = ggml_backend_vk_buffer_type(0);
+        return;
+    }
+#endif
+#ifdef USE_METAL
+    if (strcmp(g_backend, "metal") == 0) {
+        t->backend = ggml_backend_metal_init(0);
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name("Metal");
+        GGML_ASSERT(dev && "USE_METAL build but no Metal device found");
+        t->buft = ggml_backend_dev_buffer_type(dev);
         return;
     }
 #endif

@@ -43,16 +43,21 @@ ggml-audio-patch/
 │   └── qvac-ops-ggml0190.patch      # unified diff on top of patch 1 (patch 2)
 ├── tests/
 │   ├── test_learned_ops.c           # patch-1 correctness smoke tests (hand-computed references)
-│   ├── test_qvac_ops.c              # patch-2 correctness smoke tests (CPU: all 10 ops; Vulkan: 5 shader ops)
+│   ├── test_qvac_ops.c              # patch-2 correctness smoke tests (cpu | vk | metal harness hook)
 │   ├── bench_learned_ops.c          # patch-1 CPU / Vulkan / CUDA micro-benchmarks
 │   └── bench_qvac_ops.c             # patch-2 fused-vs-composed benchmarks (CPU + Vulkan)
+├── metal-reference/                 # upstream-extracted Metal kernels + host glue (NOT wired; see docs/metal-porting.md)
+│   ├── supertonic_ops.metal         # 6 kernels verbatim from qvac (MIT), frozen reference
+│   └── host-side.cpp                # kargs structs, pipeline lookup, dispatchers, supports_op gates
 ├── scripts/
 │   ├── build-and-test.sh            # Linux/macOS one-shot build + test
 │   └── build-and-test.ps1           # Windows (pwsh) one-shot build + test
+├── AGENTS.md                        # contribution & editing boundaries (human or AI agents)
 └── docs/
     ├── building.md / building_zh.md            # build prerequisites & instructions
     ├── benchmarks.md / benchmarks_zh.md        # measured performance & methodology
     ├── operators.md / operators_zh.md          # per-operator design notes & API
+    ├── metal-porting.md / metal-porting_zh.md  # Metal integration + verification + acceptance criteria
     └── porting-notes.md / porting-notes_zh.md  # known pitfalls when porting further
 ```
 
@@ -97,7 +102,7 @@ Patch 2:
 | `AFFINE_PRELU` | ✅ | ✅ | — | — |
 | `SNAKE` | ✅ | ✅ | — | — |
 
-(Upstream qvac implements the supertonic five as Metal kernels; the snake/shuffle/upsample/prelu/gru five as Vulkan shaders. This port keeps the Vulkan five, gates Metal off for all ten pending a kernel port, and CUDA off — matching upstream, which has no CUDA implementations either.)
+(Upstream qvac implements the supertonic five as Metal kernels; the snake/shuffle/upsample/prelu/gru five as Vulkan shaders. This port keeps the Vulkan five, gates Metal off for all ten pending a verified port — the upstream Metal kernels and host-side glue are preserved in [`metal-reference/`](metal-reference/), with the integration procedure, verification steps, and acceptance criteria in [docs/metal-porting.md](docs/metal-porting.md) — and gates CUDA off, matching upstream, which has no CUDA implementations either. Contribution/editing boundaries for humans and agents: [AGENTS.md](AGENTS.md).)
 
 Unsupported parameter combinations are rejected by each backend's `supports_op`, so graphs fall back to the CPU backend cleanly instead of producing wrong results.
 

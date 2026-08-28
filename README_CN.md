@@ -43,16 +43,21 @@ ggml-audio-patch/
 │   └── qvac-ops-ggml0190.patch      # 叠加在补丁一之上的统一 diff（补丁二）
 ├── tests/
 │   ├── test_learned_ops.c           # 补丁一正确性冒烟测试（手写参考值对照）
-│   ├── test_qvac_ops.c              # 补丁二正确性测试（CPU 全部 10 个；Vulkan 5 个 shader 算子）
+│   ├── test_qvac_ops.c              # 补丁二正确性测试（cpu | vk | metal 挂具钩子）
 │   ├── bench_learned_ops.c          # 补丁一 CPU / Vulkan / CUDA 微基准
 │   └── bench_qvac_ops.c             # 补丁二 融合 vs 组合图 基准（CPU + Vulkan）
+├── metal-reference/                 # 上游提取的 Metal kernel + host 胶水（未接线；见 docs/metal-porting_zh.md）
+│   ├── supertonic_ops.metal         # 6 个 kernel，逐字取自 qvac（MIT），冻结参考
+│   └── host-side.cpp                # kargs 结构体、pipeline 查找、分发函数、supports_op 门控
 ├── scripts/
 │   ├── build-and-test.sh            # Linux/macOS 一键构建+测试
 │   └── build-and-test.ps1           # Windows (pwsh) 一键构建+测试
+├── AGENTS.md                        # 贡献与编辑边界（人类或 AI agent 通用）
 └── docs/
     ├── building.md / building_zh.md            # 构建须知
     ├── benchmarks.md / benchmarks_zh.md        # 性能测试与方法论
     ├── operators.md / operators_zh.md          # 各算子设计笔记与 API
+    ├── metal-porting.md / metal-porting_zh.md  # Metal 集成步骤 + 验证方法 + 验收标准
     └── porting-notes.md / porting-notes_zh.md  # 移植坑与修复记录
 ```
 
@@ -97,7 +102,7 @@ git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch      # 补丁二�
 | `AFFINE_PRELU` | ✅ | ✅ | — | — |
 | `SNAKE` | ✅ | ✅ | — | — |
 
-（上游 qvac 中 supertonic 五件套是 Metal 内核、后五件是 Vulkan shader；本移植保留 Vulkan 五件套，Metal 全部先关闭待内核移植，CUDA 亦关闭——上游同样没有 CUDA 实现。）
+（上游 qvac 中 supertonic 五件套是 Metal 内核、后五件是 Vulkan shader；本移植保留 Vulkan 五件套，Metal 在验证过的移植落地前全部关闭——上游 Metal kernel 与 host 侧胶水已保存在 [`metal-reference/`](metal-reference/)，集成步骤、验证方法与验收标准见 [docs/metal-porting_zh.md](docs/metal-porting_zh.md)；CUDA 亦关闭——上游同样没有 CUDA 实现。人类与 agent 的贡献/编辑边界：[AGENTS.md](AGENTS.md)。）
 
 不支持的参数组合由各后端 `supports_op` 显式拒绝，计算图会干净地回落到 CPU 后端，而不是产出错误结果。
 
