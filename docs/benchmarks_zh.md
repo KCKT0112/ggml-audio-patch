@@ -96,6 +96,30 @@
 - CPU 版本是刻意保守的单线程参考实现（`n_tasks=1`），1–2.5 GFLOP/s 只作语义兜底——这两个算子在原生 ggml v0.19.0 中本来就没有 CPU 实现，属于"从无到有"。后续如有需求可并行化。
 - CUDA 的 `supports_op` 正确返回 false，上层可干净回落到 CPU。
 
+## `ADD_LEAKY_RELU` / `CONV_DIRECT_1D`（声码器端到端 + 微内核；在另一台机器上实测）
+
+> 本节专用环境：Xeon E5-2675 v3（16C/32T Haswell-EP，AVX2 负载下持续 ~2.0 GHz）、Windows、MSVC 2019 `/O2`、fp32、CPU 后端（两算子设计上仅 CPU；其他后端 `supports_op` 拒绝）。计时 = 3 次完整运行取最优。消费侧挂具为 pc-nsf-hifigan.cpp 的 `hifigan_cli`（NSF-HiFiGAN：mel=128、5 级上采样、15 个 resblock、激活最大 `[881664, C]`），精度对照 ONNX Runtime CPU fp32 参考（同机 4 748 ms）。
+
+微内核，单线程（K=11 形状的 direct-conv 内层循环，每行取最优变体）：
+
+| 变体 | GF/s |
+|---|---|
+| 纯 FMA 寄存器标定（~2.0 GHz 下 2 FMA/cycle 上限） | 63.4–64.8 |
+| 微内核，计数器 `imul` 寻址（最初写法） | 24.6 |
+| 微内核，指针递增寻址（**随补丁发布**） | **31.8** |
+
+标定值与最初内核间的 4× 差距来自 `inc → movsxd → imul` 地址链（每 tap 约 5 个串行周期）卡住 `vbroadcastss` 分发；指针递增消除之。距峰值的剩余 2× 是 FMA 关键路径上的广播 load-to-use 延迟——同一循环的寄存器驻留对照变体能跑到标定线，说明瓶颈是延迟而非带宽。
+
+声码器端到端，24 线程：
+
+| 路径 | 耗时 | 对 ORT fp32 corr | max\|Δ\| |
+|---|---|---|---|
+| 原生 `im2col` + `mul_mat`（`PCNSF_DIRECT_CONV=0`） | 10 038 ms | 0.99999999 | 1.490e-4 |
+| direct conv + `ADD_LEAKY_RELU`、无生产侧融合（`PCNSF_FUSE_IO=0`） | 5 973 ms | 0.99999999 | 1.492e-4 |
+| `conv_direct_1d_fused`（输入折入 + 残差 epilogue） | **4 764 ms** | 0.99999999 | 1.492e-4 |
+
+三条路径数值等价（rms 同为 9.8e-6；max|Δ| 只在末位有差——FMA 排序噪声）。融合路径与 ONNX Runtime CPU EP 达到 CPU 持平（多次运行超出 0.3–1.6%）。生产侧融合把计算图从 252 节点减到 152（去掉 50 leaky、5 scale、45 残差 add），输出逐位一致。
+
 ## 方法论与已知陷阱
 
 1. **测试挂具**：多后端 `ggml_backend_sched` 的输出拷贝在该基线版本上有 buffer 混叠嫌疑；本基准采用 **galloc + 单后端 `ggml_backend_graph_compute`**，张量上传/下载显式走 `ggml_backend_tensor_set/get`——与 llama.cpp 单 GPU 主流路径一致。

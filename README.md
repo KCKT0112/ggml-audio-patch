@@ -2,9 +2,9 @@
 
 > **[中文文档](README_CN.md)** | English
 
-A curated patch set that ports **fourteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0**, adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends. Shipped as three sequential unified diffs plus correctness tests and cross-backend benchmark suites.
+A curated patch set that ports **sixteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0** — fourteen adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends; plus two authored here for the NSF-HiFiGAN vocoder (a fused bias-add + leaky-ReLU, and a stride-1 direct 1-D convolution with producer-side fusions). Shipped as four unified diffs (applied in sequence; the Metal one is platform-optional) plus correctness tests and cross-backend benchmark suites.
 
-## Patch 1 — the four learned operators
+## Patch 1 — the six learned operators
 
 | Operator | Adopted from | What it adds |
 |---|---|---|
@@ -12,6 +12,8 @@ A curated patch set that ports **fourteen audio-domain operators** into [ggml](h
 | `ggml_conv_transpose_1d_ext` | [mmwillet/TTS.cpp](https://github.com/mmwillet/TTS.cpp) (ggml `support-for-tts` branch) | Full-PyTorch-parity `ConvTranspose1d`: **groups / output_padding / padding**. Also fixes the origin's broken CPU grouped path, a CUDA `op_params` mis-indexing bug, and a division-by-zero assertion. |
 | `GGML_OP_REL_POS_BIAS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR) (R bindings for ggml) | BoTNet-style two-axis relative-position attention bias: per-axis displacement lookup + per-channel dot product, with CPU and Vulkan implementations. |
 | `GGML_OP_SCATTER_ELEMENTS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR) | ONNX `ScatterElements` semantics — the inverse of `get_rows`. Vulkan implements the additive reduction with `VK_EXT_shader_atomic_float` atomics. |
+| `GGML_OP_ADD_LEAKY_RELU` | authored for [pc-nsf-hifigan.cpp](https://github.com/KakaruHayate/pc-nsf-hifigan.cpp) (NSF-HiFiGAN vocoder) | `y = leaky(a + b)` in one pass — broadcast `[1,C]` or rowwise `[T,C]` bias; bit-identical to `add` + `leaky_relu`. Also un-serializes the stock CPU `leaky_relu` kernel (`n_tasks` was forced to 1). |
+| `GGML_OP_CONV_DIRECT_1D` (+`_fused`) | authored for pc-nsf-hifigan.cpp | Stride-1 direct 1-D conv with no im2col scratch: weight packed to `[IC·K, OCp]` once per call, AVX2 6×16 micro-kernel with pointer-increment addressing (+26% single-thread vs `imul`-indexed). `_fused` folds bias / residual / output-leaky and input-side `leaky·scale` **bit-identically** — 2.1× on the full vocoder (10.0 s → 4.8 s, 24 threads, 16C/32T). |
 
 ## Patch 2 — the ten qvac fused operators
 
@@ -78,7 +80,7 @@ Apply the patches in order. Patch 3 is optional on non-Metal platforms; patch 2 
 
 Then configure / build / test — see **[docs/building.md](docs/building.md)** for prerequisites (Vulkan SDK, CUDA toolkit, Windows generator choice) and per-backend commands, or run the bundled `scripts/build-and-test.sh` / `build-and-test.ps1`.
 
-Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path. Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.80× on Apple M4 Metal; Snake reaches 3.05× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.24×.)
+Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path; 2.1× for `CONV_DIRECT_1D`+fusions on the full NSF-HiFiGAN vocoder (10 038 → 4 764 ms, 24 threads on a 16C/32T Xeon E5-2675 v3) at bit-parity with the im2col path. Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.80× on Apple M4 Metal; Snake reaches 3.05× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.24×; affine_prelu up to 6.3× Vulkan; gru fills the RNN gap at ~47 ms for H512×B4×L32 on CPU.)
 
 ## Backend support matrix
 
@@ -90,6 +92,8 @@ Patch 1:
 | `conv_transpose_1d_ext` | ✅ all params | ✅ `p0=0, d0=1` (groups ✓) | ✅ all params | ⚠️ `g0=1, p0=0` only |
 | `REL_POS_BIAS` | ✅ | ✅ | — falls back to CPU | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅ (`add` needs `shaderBufferFloat32AtomicAdd`) | — | — |
+| `ADD_LEAKY_RELU` | ✅ | — falls back to CPU | — | — |
+| `CONV_DIRECT_1D` (+`_fused`) | ✅ | — falls back to CPU | — | — |
 
 Patch 2:
 

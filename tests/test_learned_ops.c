@@ -4,11 +4,16 @@
 //   2. ggml_conv_transpose_1d_ext  == naive reference     (output_padding, groups, padding)
 //   3. ggml_scatter_elements       == naive reference     (overwrite / add, axis 0/1)
 //   4. ggml_rel_pos_bias           == naive reference
+//   5. ggml_conv_direct_1d[_fused] == naive reference     (pad/dil/bias/leaky, residual,
+//                                                          input scale/leaky fusions,
+//                                                          non-multiple-of-16 OC, tails)
+//   6. ggml_add_leaky_relu         == add + leaky_relu   (broadcast [1,C] and rowwise [T,C] bias)
 //
 // Usage: test_learned_ops [cpu|vk]
 // (vk builds link ggml-vulkan and run every case on device 0; cases the
 //  backend reports as unsupported are skipped - on Vulkan that is convT
-//  with p0 != 0 / d0 != 1 and scatter-add without VK_EXT_shader_atomic_float.)
+//  with p0 != 0 / d0 != 1 and scatter-add without VK_EXT_shader_atomic_float.
+//  conv_direct_1d / add_leaky_relu are CPU-only ops and skip on vk.)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -422,6 +427,204 @@ static void test_rel_pos_bias(void) {
     printf("  done (%d failures so far)\n", failures);
 }
 
+// ---------- 5. conv_direct_1d (+fused variants) ----------
+
+// naive reference for ggml_conv_direct_1d[_fused]:
+//   out[t, oc] = act( bias[oc] + sum_{ic,kw} w[kw, ic, oc] * xin(t + kw*dil - pad, ic) + res[t, oc] )
+//   xin(t, ic) = act_in( x[t, ic] * in_scale ), zero outside [0, T)
+// x layout [T, IC] contiguous (memory: ic*T + t), w [K, IC, OC] (oc*IC*K),
+// out [OL, OC] (oc*OL + t), OL = T + 2*pad - dil*(K-1).
+static void ref_conv_direct_1d(const float * w, const float * x, const float * b,
+                               const float * res, int K, int IC, int OC, int T,
+                               int pad, int dil, float slope, float in_scale,
+                               float in_slope, float * out, int OL) {
+    for (int oc = 0; oc < OC; oc++) {
+        for (int t = 0; t < OL; t++) {
+            float acc = b ? b[oc] : 0.0f;
+            for (int ic = 0; ic < IC; ic++) {
+                for (int kw = 0; kw < K; kw++) {
+                    const int64_t xi = (int64_t)t + (int64_t)kw*dil - pad;
+                    float xv = 0.0f;
+                    if (xi >= 0 && xi < T) {
+                        xv = x[(size_t)ic*T + xi];
+                        if (in_scale != 1.0f) xv *= in_scale;
+                        if (in_slope != 0.0f) xv = (xv > 0.0f ? xv : 0.0f) + in_slope * (xv < 0.0f ? xv : 0.0f);
+                    }
+                    acc += w[((size_t)oc*IC + ic)*K + kw] * xv;
+                }
+            }
+            if (res) acc = acc + res[(size_t)oc*OL + t];
+            if (slope != 0.0f) acc = (acc > 0.0f ? acc : 0.0f) + slope * (acc < 0.0f ? acc : 0.0f);
+            out[(size_t)oc*OL + t] = acc;
+        }
+    }
+}
+
+static void test_conv_direct_1d(void) {
+    printf("[test] conv_direct_1d / conv_direct_1d_fused vs naive reference\n");
+
+    struct {
+        int OC, IC, K, pad, dil;
+        int bias, res, fused_io;   // case config
+        float slope, in_scale, in_slope;
+    } cases[] = {
+        // basic shapes, plain conv + bias
+        {16,  8, 3, 1, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},
+        {32, 16, 3, 1, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},
+        {30, 13, 3, 1, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},   // OC,IC not multiples of 16
+        {8,   5, 7, 3, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},
+        {17,  9, 11, 5, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},  // odd OC, long kernel
+        {24, 12, 3, 3, 3, 1, 0, 0, 0.0f, 1.0f, 0.0f},   // dilated
+        {24, 12, 7, 10, 5, 1, 0, 0, 0.0f, 1.0f, 0.0f},  // K=7 dil=5
+        {6,   4, 3, 1, 1, 0, 0, 0, 0.0f, 1.0f, 0.0f},   // bias == NULL
+        {16,  8, 3, 0, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},   // pad == 0
+        // output leaky (convs1-style epilogue)
+        {16,  8, 3, 1, 1, 1, 0, 0, 0.1f, 1.0f, 0.0f},
+        {30, 13, 7, 3, 3, 1, 0, 0, 0.1f, 1.0f, 0.0f},
+        // residual (convs2-style epilogue)
+        {16,  8, 3, 1, 1, 1, 1, 0, 0.0f, 1.0f, 0.0f},
+        {30, 13, 3, 1, 1, 1, 1, 0, 0.1f, 1.0f, 0.0f},   // residual + output leaky
+        // producer-side input scale / leaky
+        {16,  8, 3, 1, 1, 1, 0, 1, 0.0f, 0.33333334f, 0.0f},
+        {16,  8, 3, 1, 1, 1, 0, 1, 0.0f, 1.0f, 0.1f},
+        {30, 13, 7, 3, 1, 1, 0, 1, 0.0f, 0.5f, 0.1f},   // scale + leaky + odd OC
+        // everything at once
+        {30, 13, 3, 1, 3, 1, 1, 1, 0.1f, 0.33333334f, 0.1f},
+    };
+
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        const int OC = cases[c].OC, IC = cases[c].IC, K = cases[c].K;
+        const int pad = cases[c].pad, dil = cases[c].dil;
+        // T chosen so OL covers: multiple of 6, remainder 1, remainder 4 (partial tail)
+        const int OL_target = 25 + (int)c;
+        const int T = OL_target + dil*(K-1) - 2*pad;
+        const int OL = T + 2*pad - dil*(K-1);
+        if (T <= 0) continue;
+
+        struct tctx t;
+        tctx_begin(&t);
+
+        struct ggml_tensor * a  = ggml_new_tensor_3d(t.ctx, GGML_TYPE_F32, K, IC, OC);
+        struct ggml_tensor * b  = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, T, IC);
+        struct ggml_tensor * vb = cases[c].bias
+            ? ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, OC) : NULL;
+        struct ggml_tensor * rr = cases[c].res
+            ? ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, OL, OC) : NULL;
+
+        float * pa = (float *)malloc(ggml_nbytes(a));
+        float * pb = (float *)malloc(ggml_nbytes(b));
+        float * pvb = vb ? (float *)malloc(ggml_nbytes(vb)) : NULL;
+        float * prr = rr ? (float *)malloc(ggml_nbytes(rr)) : NULL;
+        for (int i = 0; i < (int)ggml_nelements(a); i++) pa[i] = (float)((i*7 + (int)c) % 13) * 0.25f - 1.0f;
+        for (int i = 0; i < (int)ggml_nelements(b); i++) pb[i] = (float)((i*11 + (int)c*3) % 17) * 0.2f - 1.5f;
+        if (pvb) for (int i = 0; i < OC; i++) pvb[i] = (float)((i*5) % 7) * 0.5f - 1.0f;
+        if (prr) for (int i = 0; i < (int)ggml_nelements(rr); i++) prr[i] = (float)((i*3 + 2) % 11) * 0.3f - 1.5f;
+
+        struct ggml_tensor * r;
+        if (cases[c].res || cases[c].fused_io) {
+            r = ggml_conv_direct_1d_fused(t.ctx, a, b, vb, rr, pad, dil, cases[c].slope,
+                                          cases[c].in_scale, cases[c].in_slope);
+        } else {
+            r = ggml_conv_direct_1d(t.ctx, a, b, vb, pad, dil, cases[c].slope);
+        }
+        CHECK((int)r->ne[0] == OL && (int)r->ne[1] == OC,
+              "shape (case %zu): got [%lld,%lld] want [%d,%d]",
+              c, (long long)r->ne[0], (long long)r->ne[1], OL, OC);
+
+        if (!tctx_alloc_graph(&t, r, NULL)) {
+            free(pa); free(pb); free(pvb); free(prr); tctx_end(&t); continue;
+        }
+        tctx_upload(&t, a, pa);
+        tctx_upload(&t, b, pb);
+        if (vb) tctx_upload(&t, vb, pvb);
+        if (rr) tctx_upload(&t, rr, prr);
+        tctx_compute(&t);
+
+        float * out = (float *)malloc(ggml_nbytes(r));
+        tctx_download(&t, r, out);
+
+        float * ref = (float *)malloc((size_t)OL * OC * sizeof(float));
+        ref_conv_direct_1d(pa, pb, pvb, prr, K, IC, OC, T, pad, dil,
+                           cases[c].slope, cases[c].in_scale, cases[c].in_slope, ref, OL);
+        CHECK(vec_close(out, ref, OL*OC, 1e-4f),
+              "conv_direct_1d differs (case %zu: OC%d IC%d K%d p%d d%d bias%d res%d io%d)",
+              c, OC, IC, K, pad, dil, cases[c].bias, cases[c].res, cases[c].fused_io);
+
+        free(pa); free(pb); free(pvb); free(prr); free(out); free(ref);
+        tctx_end(&t);
+    }
+    printf("  done (%d failures so far)\n", failures);
+}
+
+// ---------- 6. add_leaky_relu ----------
+
+static void test_add_leaky_relu(void) {
+    printf("[test] add_leaky_relu vs add + leaky_relu (broadcast and rowwise bias)\n");
+
+    struct {
+        int T, C;
+        float slope;
+        int rowwise;   // 0: bias [1, C] broadcast; 1: bias [T, C] elementwise
+    } cases[] = {
+        {37, 16,  0.1f, 0},
+        {37, 16,  0.1f, 1},
+        {25, 5,   0.1f, 0},   // C < nth / odd shapes (flat fallback path)
+        {25, 5,   0.1f, 1},
+        {64, 128, 0.01f, 0},
+        {64, 128, 0.01f, 1},
+        {61, 33,  0.1f, 0},   // odd C, odd T
+        {61, 33,  0.1f, 1},
+    };
+
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        const int T = cases[c].T, C = cases[c].C;
+        struct tctx t;
+        tctx_begin(&t);
+
+        struct ggml_tensor * a = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, T, C);
+        struct ggml_tensor * b = cases[c].rowwise
+            ? ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, T, C)
+            : ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 1, C);
+
+        float * pa = (float *)malloc(ggml_nbytes(a));
+        float * pb = (float *)malloc(ggml_nbytes(b));
+        for (int i = 0; i < (int)ggml_nelements(a); i++) pa[i] = (float)((i*7 + (int)c) % 13) * 0.3f - 1.8f;
+        for (int i = 0; i < (int)ggml_nelements(b); i++) pb[i] = (float)((i*5 + 1) % 9) * 0.4f - 1.6f;
+
+        // fused op and the composed stock path, same graph
+        struct ggml_tensor * r1 = ggml_add_leaky_relu(t.ctx, a, b, cases[c].slope);
+        struct ggml_tensor * r2 = ggml_leaky_relu(t.ctx, ggml_add(t.ctx, a, b), cases[c].slope, false);
+
+        if (!tctx_alloc_graph(&t, r1, r2)) { free(pa); free(pb); tctx_end(&t); continue; }
+        tctx_upload(&t, a, pa);
+        tctx_upload(&t, b, pb);
+        tctx_compute(&t);
+
+        float * o1 = (float *)malloc(ggml_nbytes(r1));
+        float * o2 = (float *)malloc(ggml_nbytes(r2));
+        tctx_download(&t, r1, o1);
+        tctx_download(&t, r2, o2);
+
+        // exact expression contract: (v>0?v:0) + s*(v<0?v:0)
+        float * ref = (float *)malloc((size_t)T * C * sizeof(float));
+        for (int ic = 0; ic < C; ic++) {
+            for (int it = 0; it < T; it++) {
+                const size_t i = (size_t)ic*T + it;
+                const float v = pa[i] + (cases[c].rowwise ? pb[i] : pb[ic]);
+                ref[i] = (v > 0.0f ? v : 0.0f) + cases[c].slope * (v < 0.0f ? v : 0.0f);
+            }
+        }
+        CHECK(vec_close(o1, ref, T*C, 1e-5f), "add_leaky_relu differs from reference (case %zu: T%d C%d rowwise%d)",
+              c, T, C, cases[c].rowwise);
+        CHECK(vec_close(o1, o2, T*C, 1e-4f), "add_leaky_relu differs from add+leaky (case %zu: T%d C%d rowwise%d)",
+              c, T, C, cases[c].rowwise);
+
+        free(pa); free(pb); free(o1); free(o2); free(ref);
+        tctx_end(&t);
+    }
+    printf("  done (%d failures so far)\n", failures);
+}
+
 int main(int argc, char ** argv) {
     if (argc > 1) {
         g_backend = argv[1];
@@ -432,6 +635,8 @@ int main(int argc, char ** argv) {
     test_conv_transpose_1d_ext();
     test_scatter_elements();
     test_rel_pos_bias();
+    test_conv_direct_1d();
+    test_add_leaky_relu();
 
     if (failures == 0) {
         printf("\nALL PASSED\n");

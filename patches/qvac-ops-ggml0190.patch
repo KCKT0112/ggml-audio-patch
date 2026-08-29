@@ -1,5 +1,5 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index 32b8890..c0e8f39 100644
+index 818347a..2219076 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -595,6 +595,36 @@ extern "C" {
@@ -36,10 +36,10 @@ index 32b8890..c0e8f39 100644
 +        // (ACE-Step Oobleck VAE).
 +        GGML_OP_SNAKE,
 +
-         GGML_OP_COUNT,
-     };
- 
-@@ -2575,6 +2605,135 @@ extern "C" {
+         // Fused add + leaky ReLU (HiFiGAN vocoder): out[t,c] = lrelu(a[t,c] +
+         // b[t,c or c], slope).  b is either a row-broadcast bias [1,C] or an
+         // elementwise residual [T,C]; collapses conv-bias-add + activation +
+@@ -2605,6 +2635,135 @@ extern "C" {
              int                   H,
              int                   W);
  
@@ -172,14 +172,14 @@ index 32b8890..c0e8f39 100644
 +            struct ggml_tensor  * a,      // per-channel scale inside sin(), F32
 +            struct ggml_tensor  * inv_b); // per-channel output scale, F32
 +
-     GGML_API struct ggml_tensor * ggml_rwkv_wkv6(
-             struct ggml_context * ctx,
-             struct ggml_tensor  * k,
+     // --- learned-ops patch: HiFiGAN vocoder fusion ----------------------------
+     // Fused add + leaky ReLU: out = ((v > 0) ? v : 0) + slope * ((v < 0) ? v : 0)
+     // with v = a + b, bit-identical to ggml_add followed by ggml_leaky_relu.
 diff --git a/src/ggml-backend-meta.cpp b/src/ggml-backend-meta.cpp
-index b0096ba..5345a56 100644
+index ff85943..ae5c682 100644
 --- a/src/ggml-backend-meta.cpp
 +++ b/src/ggml-backend-meta.cpp
-@@ -945,6 +945,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -947,6 +947,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              } break;
              case GGML_OP_PAD_REFLECT_1D:
              case GGML_OP_ROLL:
@@ -197,7 +197,7 @@ index b0096ba..5345a56 100644
              case GGML_OP_TIMESTEP_EMBEDDING: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index b4b6eee..be8fdaa 100644
+index afd73a1..ed2eecd 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -1977,6 +1977,46 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
@@ -244,10 +244,10 @@ index b4b6eee..be8fdaa 100644
 +            {
 +                ggml_compute_forward_gru(params, tensor);
 +            } break;
-         case GGML_OP_ROLL:
+         case GGML_OP_ADD_LEAKY_RELU:
              {
-                 ggml_compute_forward_roll(params, tensor);
-@@ -2408,6 +2448,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+                 ggml_compute_forward_add_leaky_relu(params, tensor);
+@@ -2421,6 +2461,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_UPSCALE:
          case GGML_OP_PAD:
          case GGML_OP_PAD_REFLECT_1D:
@@ -261,22 +261,14 @@ index b4b6eee..be8fdaa 100644
 +        case GGML_OP_CHANNEL_SHUFFLE:
 +        case GGML_OP_AFFINE_PRELU:
 +        case GGML_OP_SNAKE:
+         case GGML_OP_ADD_LEAKY_RELU:
+         case GGML_OP_CONV_DIRECT_1D:
          case GGML_OP_ROLL:
-         case GGML_OP_ARANGE:
-         case GGML_OP_TIMESTEP_EMBEDDING:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 768e907..d8b2315 100644
+index e8fd2f1..1c0a03b 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -11,6 +11,7 @@
- #include <algorithm>
- #include <cfloat>
- #include <cmath>
-+#include <vector>
- 
- // ggml_compute_forward_dup
- 
-@@ -10589,6 +10590,485 @@ void ggml_compute_forward_rel_pos_bias(const ggml_compute_params * params, ggml_
+@@ -10624,6 +10624,377 @@ void ggml_compute_forward_rel_pos_bias(const ggml_compute_params * params, ggml_
      }
  }
  
@@ -651,10 +643,16 @@ index 768e907..d8b2315 100644
 +    }
 +}
 +
+ // learned-ops patch: fused add + leaky ReLU (HiFiGAN vocoder).
+ //   dst = lrelu(a + b, slope)  in one pass, bit-identical to
+ //   ggml_add followed by ggml_leaky_relu (same expression as
+@@ -10960,6 +11331,113 @@ void ggml_compute_forward_conv_direct_1d(
+ #endif
+ }
+ 
 +void ggml_compute_forward_zero_upsample(
 +        const ggml_compute_params * params,
 +        ggml_tensor * dst) {
-+
 +    const ggml_tensor * src = dst->src[0];
 +    GGML_ASSERT(dst->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32);
 +    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst));
@@ -763,7 +761,7 @@ index 768e907..d8b2315 100644
  
  static void ggml_compute_forward_rwkv_wkv6_f32(
 diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
-index 20099eb..b0a540d 100644
+index 07f830b..05a9b25 100644
 --- a/src/ggml-cpu/ops.h
 +++ b/src/ggml-cpu/ops.h
 @@ -122,6 +122,17 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
@@ -781,9 +779,9 @@ index 20099eb..b0a540d 100644
 +void ggml_compute_forward_channel_shuffle(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_affine_prelu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_snake(const struct ggml_compute_params * params, struct ggml_tensor * dst);
- #ifdef __cplusplus
- }
- #endif
+ // learned-ops patch (HiFiGAN vocoder fusion)
+ void ggml_compute_forward_add_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_direct_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
 index 70b1a45..6eb7def 100644
 --- a/src/ggml-vulkan/ggml-vulkan.cpp
@@ -1371,14 +1369,13 @@ index 0000000..925ebe0
 +    data_d[idx] = (f % p.s == 0u) ? D_TYPE(data_a[r * p.F + f / p.s]) : D_TYPE(0.0f);
 +}
 diff --git a/src/ggml.c b/src/ggml.c
-index 1ecd7cb..49cd3d0 100644
+index 38616ac..855fad0 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
-@@ -1102,9 +1102,21 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
-     "IM2COL_FAST_1D",
+@@ -1103,11 +1103,23 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "SCATTER_ELEMENTS",
      "REL_POS_BIAS",
-+
+ 
 +    "SUPERTONIC_DEPTHWISE_1D",
 +    "SUPERTONIC_LAYER_NORM_CHANNEL",
 +    "SUPERTONIC_PW2_RESIDUAL",
@@ -1390,18 +1387,20 @@ index 1ecd7cb..49cd3d0 100644
 +    "CHANNEL_SHUFFLE",
 +    "AFFINE_PRELU",
 +    "SNAKE",
++
+     "ADD_LEAKY_RELU",
+     "CONV_DIRECT_1D",
  };
  
--static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
-+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 114");
+-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
++static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1221,9 +1233,21 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
-     "im2col_fast_1d(x)",
+@@ -1225,11 +1237,23 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "scatter_elements(data, idx, upd)",
      "rel_pos_bias(x, wcat)",
-+
+ 
 +    "supertonic_depthwise_1d(x,w,b)",
 +    "supertonic_layer_norm_channel(x,g,b)",
 +    "supertonic_pw2_residual(x,b,gamma,res)",
@@ -1413,14 +1412,17 @@ index 1ecd7cb..49cd3d0 100644
 +    "channel_shuffle(x)",
 +    "affine_prelu(x,aw,ab,slope)",
 +    "snake(x,a,inv_b)",
++
+     "add_leaky_relu(a,b,slope)",
+     "conv_direct_1d(w,x,b,pad,dil,slope)",
  };
  
--static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
-+static_assert(GGML_OP_COUNT == 114, "GGML_OP_COUNT != 104");
+-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
++static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5910,6 +5934,327 @@ struct ggml_tensor * ggml_rel_pos_bias(
+@@ -5955,6 +5979,327 @@ struct ggml_tensor * ggml_rel_pos_bias(
      return result;
  }
  
@@ -1745,9 +1747,9 @@ index 1ecd7cb..49cd3d0 100644
 +    return result;
 +}
 +
- // ggml_rwkv_wkv6
+ // ggml_add_leaky_relu
  
- struct ggml_tensor * ggml_rwkv_wkv6(
+ struct ggml_tensor * ggml_add_leaky_relu(
 diff --git a/tests-learned/bench_qvac_ops.c b/tests-learned/bench_qvac_ops.c
 new file mode 100644
 index 0000000..0374b93

@@ -96,6 +96,30 @@ Cross-backend (CPU / Vulkan / CUDA) micro-benchmarks produced by `tests/bench_le
 - The CPU kernels are deliberately conservative single-threaded reference implementations (`n_tasks=1`): 1–2.5 GFLOP/s as a semantic fallback. Upstream v0.19.0 has no CPU implementation of either operator at all — this patch adds them from zero; parallelizing them is a contained follow-up if needed.
 - CUDA's `supports_op` correctly returns false, so schedulers fall back to CPU cleanly.
 
+## `ADD_LEAKY_RELU` / `CONV_DIRECT_1D` (vocoder end-to-end + micro-kernel; measured on a second machine)
+
+> Environment for this section only: Xeon E5-2675 v3 (16C/32T Haswell-EP, sustained ~2.0 GHz under AVX2 load), Windows, MSVC 2019 `/O2`, fp32, CPU backend (both ops are CPU-only by design; other backends reject in `supports_op`). Timing = best of 3 full runs. The consumer harness is the pc-nsf-hifigan.cpp `hifigan_cli` (NSF-HiFiGAN: mel=128, 5 upsample levels, 15 resblocks, activations up to `[881664, C]`), accuracy against an ONNX Runtime CPU fp32 reference (4 748 ms on the same machine).
+
+Micro-kernel, single-thread (K=11-shaped direct-conv inner loop, best variant per row):
+
+| variant | GF/s |
+|---|---|
+| pure-FMA register calibration (2 FMA/cycle ceiling @ ~2.0 GHz) | 63.4–64.8 |
+| micro-kernel, `imul`-on-counter addressing (as first written) | 24.6 |
+| micro-kernel, pointer-increment addressing (**shipped**) | **31.8** |
+
+The 4× gap between calibration and the original kernel is the `inc → movsxd → imul` address chain (≈5 serial cycles per kernel tap) gating `vbroadcastss` dispatch; pointer increments remove it. The residual 2× vs peak is broadcast load-to-use latency on the FMA critical path — a register-resident control variant of the same loop reaches the calibration line, so it is a latency-bound, not bandwidth-bound, residual.
+
+End-to-end vocoder, 24 threads:
+
+| path | time | corr vs ORT fp32 | max\|Δ\| |
+|---|---|---|---|
+| stock `im2col` + `mul_mat` (`PCNSF_DIRECT_CONV=0`) | 10 038 ms | 0.99999999 | 1.490e-4 |
+| direct conv + `ADD_LEAKY_RELU`, no producer fusions (`PCNSF_FUSE_IO=0`) | 5 973 ms | 0.99999999 | 1.492e-4 |
+| `conv_direct_1d_fused` (input fold + residual epilogue) | **4 764 ms** | 0.99999999 | 1.492e-4 |
+
+All three paths are numerically equivalent (identical rms 9.8e-6; the max|Δ| values differ only in their last digit — FMA-ordering noise). The fused path reaches CPU parity with the ONNX Runtime CPU EP (0.3–1.6% over across runs). Producer-side fusions removed 100 of 252 graph nodes (50 leaky, 5 scale, 45 residual add) with bit-identical output.
+
 ## Methodology & known traps
 
 1. **Harness**: output copies through the multi-backend `ggml_backend_sched` showed buffer-aliasing anomalies on this baseline; the benchmark uses a **graph allocator + single-backend `ggml_backend_graph_compute`**, with explicit `ggml_backend_tensor_set/get` for host↔device transfers — the same path llama.cpp takes on single-GPU deployments.

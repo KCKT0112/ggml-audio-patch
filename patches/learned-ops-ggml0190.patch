@@ -1,8 +1,8 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index 5cb49d0..32b8890 100644
+index 5cb49d0..818347a 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
-@@ -590,6 +590,11 @@ extern "C" {
+@@ -590,6 +590,23 @@ extern "C" {
  
          GGML_OP_GLU,
  
@@ -11,10 +11,22 @@ index 5cb49d0..32b8890 100644
 +        GGML_OP_SCATTER_ELEMENTS,
 +        GGML_OP_REL_POS_BIAS,
 +
++        // Fused add + leaky ReLU (HiFiGAN vocoder): out[t,c] = lrelu(a[t,c] +
++        // b[t,c or c], slope).  b is either a row-broadcast bias [1,C] or an
++        // elementwise residual [T,C]; collapses conv-bias-add + activation +
++        // residual-add chains into a single pass.
++        GGML_OP_ADD_LEAKY_RELU,
++
++        // Fused stride-1 direct 1D convolution (HiFiGAN vocoder): packs the
++        // kernel to [IC*K, OC] once per call and runs AVX2-blocked output
++        // tiles without materializing an im2col buffer; optional bias add +
++        // leaky ReLU in the epilogue.  CPU only.
++        GGML_OP_CONV_DIRECT_1D,
++
          GGML_OP_COUNT,
      };
  
-@@ -1679,6 +1684,20 @@ extern "C" {
+@@ -1679,6 +1696,20 @@ extern "C" {
              struct ggml_tensor  * b,  // row indices
              struct ggml_tensor  * c); // data for ggml_get_rows, only used for its shape
  
@@ -35,10 +47,28 @@ index 5cb49d0..32b8890 100644
      // a TD  [n_embd, ne1,    ne2,    ne3]
      // b TS  [n_embd, n_rows, ne02,   ne03] | ne02 == ne2, ne03 == ne3
      // c I64 [n_rows, ne11,   ne12,   1]    | c[i] in [0, ne1)
-@@ -2036,6 +2055,19 @@ extern "C" {
+@@ -2036,6 +2067,37 @@ extern "C" {
              int                   p0,  // padding
              int                   d0); // dilation
  
++    // Public form of the im2col tagged with GGML_OP_IM2COL_FAST_1D (see the
++    // conv_1d_fast_1d_im2col comment below).  The explicit dst_type lets
++    // precision-sensitive callers keep an F32 im2col buffer (GGML_TYPE_F32)
++    // while still getting the 1D-specialized CPU kernel; passing
++    // GGML_TYPE_F16 reproduces the stock ggml_conv_1d memory layout.
++    // ow_align > 1 rounds the output length up to a multiple of ow_align
++    // (extra rows come from zero windows == conv zero padding, so callers can
++    // crop them with a free view); use it to keep GEMM-friendly shapes.
++    GGML_API struct ggml_tensor * ggml_im2col_fast_1d(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,   // convolution kernel [K, IC, OC]
++            struct ggml_tensor  * b,   // data [T, IC]
++            int                   s0,  // stride
++            int                   p0,  // padding
++            int                   d0,  // dilation
++            enum ggml_type        dst_type,
++            int                   ow_align);
++
 +    // ggml_conv_1d variant that tags the intermediate im2col tensor with
 +    // GGML_OP_IM2COL_FAST_1D so CPU schedules the 1D-specialized kernel
 +    // (O(1) valid-window memcpy per row instead of the generic im2col loops).
@@ -55,7 +85,7 @@ index 5cb49d0..32b8890 100644
      // conv_1d with padding = half
      // alias for ggml_conv_1d(a, b, s, a->ne[0]/2, d)
      GGML_API struct ggml_tensor* ggml_conv_1d_ph(
-@@ -2070,6 +2102,25 @@ extern "C" {
+@@ -2070,6 +2132,25 @@ extern "C" {
              int                   p0,  // padding
              int                   d0); // dilation
  
@@ -81,7 +111,7 @@ index 5cb49d0..32b8890 100644
      GGML_API struct ggml_tensor * ggml_conv_2d(
              struct ggml_context * ctx,
              struct ggml_tensor  * a,   // convolution kernel
-@@ -2511,6 +2562,19 @@ extern "C" {
+@@ -2511,6 +2592,71 @@ extern "C" {
              struct ggml_tensor  * pw,
              struct ggml_tensor  * ph);
  
@@ -98,23 +128,86 @@ index 5cb49d0..32b8890 100644
 +            int                   H,
 +            int                   W);
 +
++    // --- learned-ops patch: HiFiGAN vocoder fusion ----------------------------
++    // Fused add + leaky ReLU: out = ((v > 0) ? v : 0) + slope * ((v < 0) ? v : 0)
++    // with v = a + b, bit-identical to ggml_add followed by ggml_leaky_relu.
++    // a: [T, C] contiguous F32; b: [1, C] row-broadcast bias (per-channel
++    // scalar) or [T, C] elementwise operand (e.g. a residual), contiguous F32.
++    // CPU only (other backends fall back by not emitting the op).
++    GGML_API struct ggml_tensor * ggml_add_leaky_relu(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,      // [T, C]
++            struct ggml_tensor  * b,      // [1, C] or [T, C]
++            float                 slope);
++
++    // --- learned-ops patch: HiFiGAN direct conv --------------------------------
++    // Fused stride-1 1D convolution with in-kernel weight packing (no im2col
++    // buffer): out[t, oc] = sum_{ic,kw} w[kw, ic, oc] * x[t + kw*dil - pad, ic]
++    // + bias[oc], then leaky ReLU(slope) when slope != 0 (bit-identical to
++    // conv -> ggml_add -> ggml_leaky_relu).
++    //   w:    [K, IC, OC] F32 (standard layout, any strides ok)
++    //   x:    [T, IC] contiguous F32
++    //   bias: [OC] F32 or NULL
++    //   out:  [OL, OC] with OL = T + 2*pad - dil*(K-1)
++    // CPU only; other backends never emit the op.
++    GGML_API struct ggml_tensor * ggml_conv_direct_1d(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * w,      // [K, IC, OC]
++            struct ggml_tensor  * x,      // [T, IC]
++            struct ggml_tensor  * bias,   // [OC] or NULL
++            int                   pad,
++            int                   dil,
++            float                 leaky_slope);   // 0 = no activation
++
++    // fused variant with two extra producer-side fusions (CPU only):
++    //   res:       [OL, OC] contiguous or NULL; when set the epilogue adds it
++    //              (out = (bias + acc) + res, the same association as
++    //              ggml_add(conv_out, res)) replacing a separate ADD node.
++    //   in_scale:  multiply x while packing the padded copy (replaces
++    //              ggml_scale; 1.0f = off).  Applied first, i.e. pad(x*s).
++    //   in_slope:  leaky-ReLU applied to x while packing (replaces a preceding
++    //              ggml_leaky_relu; 0.0f = off).  Applied after in_scale:
++    //              pad(leaky(x * s)) == leaky(ggml_scale(x, s)) bit-identically.
++    GGML_API struct ggml_tensor * ggml_conv_direct_1d_fused(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * w,      // [K, IC, OC]
++            struct ggml_tensor  * x,      // [T, IC]
++            struct ggml_tensor  * bias,   // [OC] or NULL
++            struct ggml_tensor  * res,    // [OL, OC] or NULL
++            int                   pad,
++            int                   dil,
++            float                 leaky_slope,   // 0 = no output activation
++            float                 in_scale,      // 1 = no input scaling
++            float                 in_slope);     // 0 = no input activation
++
      GGML_API struct ggml_tensor * ggml_rwkv_wkv6(
              struct ggml_context * ctx,
              struct ggml_tensor  * k,
 diff --git a/src/ggml-backend-meta.cpp b/src/ggml-backend-meta.cpp
-index a5a3a58..b0096ba 100644
+index a5a3a58..ff85943 100644
 --- a/src/ggml-backend-meta.cpp
 +++ b/src/ggml-backend-meta.cpp
-@@ -927,6 +927,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -823,7 +823,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_ADD:
+-            case GGML_OP_ADD_ID: {
++            case GGML_OP_ADD_ID:
++            case GGML_OP_ADD_LEAKY_RELU: {
+                 split_state = handle_bin_bcast(src_ss);
+             } break;
+             case GGML_OP_ADD1:
+@@ -927,6 +928,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              } break;
              case GGML_OP_CONV_TRANSPOSE_1D:
              case GGML_OP_IM2COL:
 +            case GGML_OP_IM2COL_FAST_1D:
++            case GGML_OP_CONV_DIRECT_1D:
              case GGML_OP_IM2COL_BACK:
              case GGML_OP_IM2COL_3D:
              case GGML_OP_CONV_2D:
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 491316f..b4b6eee 100644
+index 491316f..afd73a1 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -1913,6 +1913,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
@@ -143,7 +236,39 @@ index 491316f..b4b6eee 100644
          case GGML_OP_CONV_2D:
              {
                  ggml_compute_forward_conv_2d(params, tensor);
-@@ -2370,6 +2382,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -1965,6 +1977,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_pad_reflect_1d(params, tensor);
+             } break;
++        case GGML_OP_ADD_LEAKY_RELU:
++            {
++                ggml_compute_forward_add_leaky_relu(params, tensor);
++            } break;
++        case GGML_OP_CONV_DIRECT_1D:
++            {
++                ggml_compute_forward_conv_direct_1d(params, tensor);
++            } break;
+         case GGML_OP_ROLL:
+             {
+                 ggml_compute_forward_roll(params, tensor);
+@@ -2264,10 +2284,15 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             } break;
+         case GGML_OP_REPEAT:
+         case GGML_OP_REPEAT_BACK:
+-        case GGML_OP_LEAKY_RELU:
+             {
+                 n_tasks = 1;
+             } break;
++        case GGML_OP_LEAKY_RELU:
++            {
++                // learned-ops patch: run multi-threaded (row split, identical
++                // arithmetic per element); upstream forced n_tasks = 1
++                n_tasks = n_threads;
++            } break;
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(node)) {
+                 case GGML_UNARY_OP_ABS:
+@@ -2370,6 +2395,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                  n_tasks = MIN(n_threads, ggml_nrows(node->src[0]));
              } break;
          case GGML_OP_IM2COL:
@@ -151,7 +276,7 @@ index 491316f..b4b6eee 100644
          case GGML_OP_IM2COL_BACK:
          case GGML_OP_IM2COL_3D:
          case GGML_OP_CONV_2D:
-@@ -2381,6 +2394,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2381,6 +2407,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
              {
                  n_tasks = n_threads;
              } break;
@@ -163,11 +288,69 @@ index 491316f..b4b6eee 100644
          case GGML_OP_POOL_1D:
          case GGML_OP_POOL_2D:
          case GGML_OP_POOL_2D_BACK:
+@@ -2390,6 +2421,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_UPSCALE:
+         case GGML_OP_PAD:
+         case GGML_OP_PAD_REFLECT_1D:
++        case GGML_OP_ADD_LEAKY_RELU:
++        case GGML_OP_CONV_DIRECT_1D:
+         case GGML_OP_ROLL:
+         case GGML_OP_ARANGE:
+         case GGML_OP_TIMESTEP_EMBEDDING:
+@@ -2879,6 +2912,15 @@ struct ggml_cplan ggml_graph_plan(
+                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                         }
+                     } break;
++                case GGML_OP_CONV_DIRECT_1D:
++                    {
++                        // packed kernel [IC*K, OCp] + padded bias + padded X rows
++                        const int64_t OCp = ((node->src[0]->ne[2] + 15) / 16) * 16;
++                        const int64_t pad = ggml_get_op_params_i32(node, 0);
++                        const int64_t L   = node->src[1]->ne[0] + 2*pad;
++                        cur = sizeof(float) * (OCp * node->src[0]->ne[1] * node->src[0]->ne[0]
++                                               + OCp + node->src[1]->ne[1] * L);
++                    } break;
+                 case GGML_OP_SET_ROWS:
+                     {
+                         if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 42ec809..768e907 100644
+index 42ec809..e8fd2f1 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -6169,7 +6169,7 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
+@@ -11,6 +11,7 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <vector>
+ 
+ // ggml_compute_forward_dup
+ 
+@@ -2704,10 +2705,6 @@ static void ggml_compute_forward_leaky_relu_f32(
+ 
+     const ggml_tensor * src0 = dst->src[0];
+ 
+-    if (params->ith != 0) {
+-        return;
+-    }
+-
+     assert(ggml_is_contiguous_1(src0));
+     assert(ggml_is_contiguous_1(dst));
+     assert(ggml_are_same_shape(src0, dst));
+@@ -2721,7 +2718,12 @@ static void ggml_compute_forward_leaky_relu_f32(
+     assert(dst->nb[0]  == sizeof(float));
+     assert(src0->nb[0] == sizeof(float));
+ 
+-    for (int i = 0; i < n; i++) {
++    // learned-ops patch: parallelize over rows (upstream ran single-threaded,
++    // `if (params->ith != 0) return;`); identical arithmetic per element.
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    for (int i = ith; i < n; i += nth) {
+         ggml_vec_leaky_relu_f32(nc,
+                 (float *) ((char *) dst->data  + i*( dst->nb[1])),
+                 (float *) ((char *) src0->data + i*(src0->nb[1])), negative_slope);
+@@ -6169,7 +6171,7 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
      if (ith == 0) {
          memset(params->wdata, 0, params->wsize);
  
@@ -176,7 +359,7 @@ index 42ec809..768e907 100644
          {
              ggml_fp16_t * const wdata = (ggml_fp16_t *) params->wdata + 0;
  
-@@ -6203,6 +6203,14 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
+@@ -6203,6 +6205,14 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
      ggml_barrier(params->threadpool);
  
      const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
@@ -191,7 +374,7 @@ index 42ec809..768e907 100644
  
      // total rows in dst
      const int nr = ne1;
-@@ -6219,15 +6227,20 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
+@@ -6219,15 +6229,20 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
  
      for (int i1 = ir0; i1 < ir1; i1++) {
          float * dst_data = (float *)((char *) dst->data + i1*nb1);
@@ -215,7 +398,7 @@ index 42ec809..768e907 100644
              }
          }
      }
-@@ -6257,7 +6270,7 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
+@@ -6257,7 +6272,7 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
      if (ith == 0) {
          memset(params->wdata, 0, params->wsize);
  
@@ -224,7 +407,7 @@ index 42ec809..768e907 100644
          {
              float * const wdata = (float *) params->wdata + 0;
  
-@@ -6291,6 +6304,11 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
+@@ -6291,6 +6306,11 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
      ggml_barrier(params->threadpool);
  
      const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
@@ -236,7 +419,7 @@ index 42ec809..768e907 100644
  
      // total rows in dst
      const int nr = ne1;
-@@ -6307,15 +6325,20 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
+@@ -6307,15 +6327,20 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
  
      for (int i1 = ir0; i1 < ir1; i1++) {
          float * dst_data = (float *)((char *) dst->data + i1*nb1);
@@ -260,7 +443,7 @@ index 42ec809..768e907 100644
              }
          }
      }
-@@ -6522,6 +6545,191 @@ void ggml_compute_forward_im2col(
+@@ -6522,6 +6547,224 @@ void ggml_compute_forward_im2col(
      }
  }
  
@@ -325,31 +508,64 @@ index 42ec809..768e907 100644
 +
 +    float * const wdata = (float *) dst->data;
 +
++    // Thread split over output positions (NOT channels): each thread writes a
++    // contiguous range of [IC*KW] rows, so stores are full streaming lines.
++    // (A channel-strided split interleaves KW-float stores from nth threads
++    // into the same rows and write-combining collapses; measured ~8x slower
++    // on 16 threads.)  Within a row the per-channel KW blocks are adjacent,
++    // so the whole row is written sequentially.
++    //
++    // Additionally the thread's row range is processed in tiles sized so the
++    // per-channel source segments stay L2-resident across the tile: with a
++    // plain iow-major loop every output row re-reads KW floats from each of
++    // the IC channel rows and the working set (IC x T floats) overflows L2/L3,
++    // so reads stream from RAM OW/KW times.  Tiling restores read locality.
++    const int64_t tile = std::max<int64_t>(32, std::min<int64_t>(
++        4096, (int64_t)(32768 / (IC * (KW + 1)))));  // ~128KB src+dst per tile
++
 +    for (int64_t in = 0; in < N; ++in) {
-+        for (int64_t iow = 0; iow < OW; ++iow) {
-+            const int64_t base = iow*s0 - p0;
-+            const int64_t ikw0 = ggml_im2col_1d_valid_start(base, d0);
-+            const int64_t ikw1 = ggml_im2col_1d_valid_end(base, d0, IW, KW);
++        const int64_t rows = OW;
++        const int64_t chunk = (rows + nth - 1) / nth;
++        const int64_t iow0 = ith * chunk;
++        const int64_t iow1 = std::min(rows, iow0 + chunk);
 +
-+            for (int64_t iic = ith; iic < IC; iic += nth) {
-+                float * const dst_row = wdata + (in*OW + iow)*(IC*KW) + iic*KW;
-+                const float * const src_row = (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1);
++        for (int64_t t0 = iow0; t0 < iow1; t0 += tile) {
++            const int64_t t1 = std::min(iow1, t0 + tile);
++            for (int64_t iow = t0; iow < t1; ++iow) {
++                const int64_t base = iow*s0 - p0;
++                const int64_t ikw0 = ggml_im2col_1d_valid_start(base, d0);
++                const int64_t ikw1 = ggml_im2col_1d_valid_end(base, d0, IW, KW);
++                const int64_t ncopy = ikw1 - ikw0;
 +
-+                if (ikw0 > 0) {
-+                    memset(dst_row, 0, ikw0*sizeof(float));
-+                }
-+                if (ikw1 > ikw0) {
-+                    if (d0 == 1) {
-+                        memcpy(dst_row + ikw0, src_row + base + ikw0, (ikw1 - ikw0)*sizeof(float));
-+                    } else {
-+                        int64_t iiw = base + ikw0*d0;
-+                        for (int64_t ikw = ikw0; ikw < ikw1; ++ikw, iiw += d0) {
-+                            dst_row[ikw] = src_row[iiw];
++                float * const dst_row = wdata + (in*OW + iow)*(IC*KW);
++                for (int64_t iic = 0; iic < IC; ++iic) {
++                    const float * const src_row = (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1);
++                    float * const dst_blk = dst_row + iic*KW;
++
++                    if (ikw0 > 0) {
++                        memset(dst_blk, 0, ikw0*sizeof(float));
++                    }
++                    if (ncopy > 0) {
++                        if (d0 == 1) {
++                            const float * s = src_row + base + ikw0;
++                            float * d = dst_blk + ikw0;
++                            if (ncopy <= 8) {
++                                // inline: a memcpy call for 12-32B costs more
++                                // than the copy itself at KW=3..8
++                                for (int64_t k = 0; k < ncopy; ++k) d[k] = s[k];
++                            } else {
++                                memcpy(d, s, ncopy*sizeof(float));
++                            }
++                        } else {
++                            int64_t iiw = base + ikw0*d0;
++                            for (int64_t ikw = ikw0; ikw < ikw1; ++ikw, iiw += d0) {
++                                dst_blk[ikw] = src_row[iiw];
++                            }
 +                        }
 +                    }
-+                }
-+                if (ikw1 < KW) {
-+                    memset(dst_row + ikw1, 0, (KW - ikw1)*sizeof(float));
++                    if (ikw1 < KW) {
++                        memset(dst_blk + ikw1, 0, (KW - ikw1)*sizeof(float));
++                    }
 +                }
 +            }
 +        }
@@ -452,7 +668,7 @@ index 42ec809..768e907 100644
  // ggml_compute_forward_im2col_back_f32
  
  void ggml_compute_forward_im2col_back_f32(
-@@ -10248,6 +10456,139 @@ void ggml_compute_forward_add_rel_pos(
+@@ -10248,6 +10491,475 @@ void ggml_compute_forward_add_rel_pos(
      }
  }
  
@@ -589,11 +805,347 @@ index 42ec809..768e907 100644
 +    }
 +}
 +
++// learned-ops patch: fused add + leaky ReLU (HiFiGAN vocoder).
++//   dst = lrelu(a + b, slope)  in one pass, bit-identical to
++//   ggml_add followed by ggml_leaky_relu (same expression as
++//   ggml_vec_leaky_relu_f32, applied to the fused sum).
++//   a: [T, C] contiguous F32; b: [1, C] row-broadcast bias or [T, C]
++//   elementwise operand, contiguous F32.
++void ggml_compute_forward_add_leaky_relu(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * a = dst->src[0];   // [T, C]
++    const ggml_tensor * b = dst->src[1];   // [1, C] or [T, C]
++
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(b->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_is_contiguous(b));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
++    GGML_ASSERT(dst->ne[0] == a->ne[0] && dst->ne[1] == a->ne[1]);
++    GGML_ASSERT(a->ne[1] == b->ne[1]);
++    GGML_ASSERT(b->ne[0] == 1 || b->ne[0] == a->ne[0]);
++
++    const int64_t T = a->ne[0];
++    const int64_t C = a->ne[1];
++
++    float slope;
++    memcpy(&slope, dst->op_params, sizeof(float));
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const float * a_data = (const float *) a->data;
++    const float * b_data = (const float *) b->data;
++          float * y_data = (float *)       dst->data;
++
++    const bool elementwise = b->ne[0] != 1;
++
++    if (C >= nth) {
++        // Fast path: stripe over channels.  The bias value stays in a
++        // register and the inner loop walks contiguous t for both inputs and
++        // the output (auto-vectorizable: two selects + mul + add).
++        for (int64_t c = ith; c < C; c += nth) {
++            const float * ap = a_data + c * T;
++            const float * bp = b_data + (elementwise ? c * T : c);
++                  float * yp = y_data + c * T;
++            if (elementwise) {
++                for (int64_t t = 0; t < T; ++t) {
++                    const float v = ap[t] + bp[t];
++                    yp[t] = (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
++                }
++            } else {
++                const float bv = bp[0];
++                for (int64_t t = 0; t < T; ++t) {
++                    const float v = ap[t] + bv;
++                    yp[t] = (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
++                }
++            }
++        }
++    } else {
++        // Few channels (e.g. C < n_threads): split the flattened element
++        // range instead, aligned to row boundaries so the broadcast bias
++        // index only changes between rows.
++        const int64_t total = C * T;
++        const int64_t per   = (total + nth - 1) / nth;
++        const int64_t start = (int64_t) ith * per;
++        const int64_t stop  = MIN(start + per, total);
++        int64_t c = start / T;
++        int64_t t = start - c * T;
++        for (int64_t i = start; i < stop; /* advanced below */) {
++            const int64_t chunk = MIN(stop - i, T - t);
++            const float * ap = a_data + c * T + t;
++            const float * bp = b_data + (elementwise ? c * T + t : c);
++                  float * yp = y_data + c * T + t;
++            if (elementwise) {
++                for (int64_t k = 0; k < chunk; ++k) {
++                    const float v = ap[k] + bp[k];
++                    yp[k] = (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
++                }
++            } else {
++                const float bv = bp[0];
++                for (int64_t k = 0; k < chunk; ++k) {
++                    const float v = ap[k] + bv;
++                    yp[k] = (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
++                }
++            }
++            i += chunk;
++            t += chunk;
++            if (t == T) { t = 0; ++c; }
++        }
++    }
++}
++
++// learned-ops patch: fused direct stride-1 1D convolution (HiFiGAN).
++//   out[t, oc] = sum_{ic, kw} w[kw, ic, oc] * x[t + kw*dil - pad, ic]
++//                (+ bias[oc]), then leaky ReLU(slope) when slope != 0.
++// No im2col buffer: the kernel is packed once per call into
++//   Wt[k = ic*K + kw][oc]  (row-major [IC*K, OCp], OCp = OC rounded up to 16)
++// by all threads in parallel (disjoint oc columns) followed by a threadpool
++// barrier, then each thread owns a balanced range of output t-blocks:
++//   for each oc-block (16 cols of Wt stay in L1/L2):
++//     for each 6-wide t-block in the thread's range: 6x16 AVX2 micro-kernel.
++// X rows of the thread's t-range stay L2-resident across the oc-block loop,
++// so X streams from RAM exactly once per call.  Edge tiles (conv boundary
++// clamp, partial t tail, partial oc tail) run a scalar path.
++// The epilogue applies bias + leaky with the exact stock expression
++// ((v > 0) ? v : 0) + slope * ((v < 0) ? v : 0) for bit-identical output.
++void ggml_compute_forward_conv_direct_1d(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * w    = dst->src[0];   // [K, IC, OC]
++    const ggml_tensor * x    = dst->src[1];   // [T, IC] contiguous
++    const ggml_tensor * bias = dst->src[2];   // [OC] or NULL
++
++    GGML_ASSERT(w->type == GGML_TYPE_F32);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++
++    const int64_t K  = w->ne[0];
++    const int64_t IC = w->ne[1];
++    const int64_t OC = w->ne[2];
++    const int64_t T  = x->ne[0];
++    const int64_t OL = dst->ne[0];
++
++    const int pad = ggml_get_op_params_i32(dst, 0);
++    const int dil = ggml_get_op_params_i32(dst, 1);
++    float slope;
++    memcpy(&slope, (const char *) dst->op_params + 2 * sizeof(int32_t), sizeof(float));
++    const bool has_bias = ggml_get_op_params_i32(dst, 3) != 0;
++    float in_scale;
++    memcpy(&in_scale, (const char *) dst->op_params + 4 * sizeof(int32_t), sizeof(float));
++    float in_slope;
++    memcpy(&in_slope, (const char *) dst->op_params + 5 * sizeof(int32_t), sizeof(float));
++    const bool has_res = ggml_get_op_params_i32(dst, 6) != 0;
++    const bool has_act  = slope != 0.0f;
++    const bool has_in   = in_scale != 1.0f || in_slope != 0.0f;
++    const ggml_tensor * res = dst->src[3];   // [OL, OC] contiguous or NULL
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t OCp = ((OC + 15) / 16) * 16;
++    const int64_t KP  = IC * K;
++    const int64_t L   = T + 2*pad;              // padded X row length
++
++    float * wdata = (float *) params->wdata;
++    float * Wt    = wdata;                      // [KP][OCp] packed kernel
++    float * bp    = wdata + KP * OCp;           // [OCp] bias, zero padded
++    float * Xp    = bp + OCp;                   // [IC][L] zero-padded X
++    GGML_ASSERT(params->wsize >= (size_t)(KP * OCp + OCp + IC * L) * sizeof(float));
++
++    const float * x_data = (const float *) x->data;
++    const float * w_data = (const float *) w->data;
++    const float * b_data = bias ? (const float *) bias->data : nullptr;
++    const float * r_data = has_res ? (const float *) res->data : nullptr;
++          float * o_data = (float *) dst->data;
++
++    // phase 1 (parallel, disjoint): pack W^T columns, bias, and the
++    // zero-padded X copy (removes all boundary clamping from phase 2)
++    {
++        const int64_t per = (OCp + nth - 1) / nth;
++        const int64_t c0  = std::min<int64_t>(ith * per, OCp);
++        const int64_t c1  = std::min<int64_t>(c0 + per, OCp);
++        for (int64_t oc = c0; oc < c1; ++oc) {
++            for (int64_t ic = 0; ic < IC; ++ic) {
++                for (int64_t kw = 0; kw < K; ++kw) {
++                    // w[kw, ic, oc] row-major: ((oc*IC) + ic)*K + kw
++                    const float v = (oc < OC)
++                        ? w_data[((oc * IC) + ic) * K + kw]
++                        : 0.0f;
++                    Wt[(ic * K + kw) * OCp + oc] = v;
++                }
++            }
++            bp[oc] = (oc < OC && b_data) ? b_data[oc] : 0.0f;
++        }
++    }
++    {
++        // X rows are large; split rows across threads instead.
++        // When has_in, the pad copy also folds the producer-side
++        // scale/leaky (bit-identical: leaky(x * s) elementwise, applied
++        // here once per element instead of in a separate pass).
++        const int64_t per_ic = (IC + nth - 1) / nth;
++        const int64_t ic0 = std::min<int64_t>(ith * per_ic, IC);
++        const int64_t ic1 = std::min<int64_t>(ic0 + per_ic, IC);
++        for (int64_t ic = ic0; ic < ic1; ++ic) {
++            float * row = Xp + ic * L;
++            memset(row, 0, pad * sizeof(float));
++            if (!has_in) {
++                memcpy(row + pad, x_data + ic * T, T * sizeof(float));
++            } else {
++                const float * src = x_data + ic * T;
++                float * dstv = row + pad;
++                for (int64_t t = 0; t < T; ++t) {
++                    float v = src[t];
++                    if (in_scale != 1.0f) v *= in_scale;
++                    if (in_slope != 0.0f) v = (v > 0.f ? v : 0.f) + in_slope * (v < 0.f ? v : 0.f);
++                    dstv[t] = v;
++                }
++            }
++            memset(row + pad + T, 0, (L - pad - T) * sizeof(float));
++        }
++    }
++
++    ggml_barrier(params->threadpool);
++
++    // phase 2: each thread owns a balanced range of 6-wide t-blocks.  Within
++    // the range, superblocks (oc-super x t-super) keep the X slice and the
++    // packed-W slice L2-resident: the t-super's X window is re-read from L2
++    // across the oc loop, the oc-super's Wt columns from L2/L3 across the t
++    // loop, so both X and Wt stream from RAM roughly once per call.
++    const int64_t TB  = 6;                      // micro-kernel t height
++    const int64_t n_tb = (OL + TB - 1) / TB;    // 6-wide t blocks
++    const int64_t n_ob = OCp / 16;              // 16-wide oc blocks
++
++    // superblock sizes: X slice <= ~64KB, Wt slice <= ~128KB
++    const int64_t TSB = std::max<int64_t>(1, std::min<int64_t>(32,
++            (int64_t)(65536 / (TB * IC * 4 + 1))));
++    const int64_t OSB = std::max<int64_t>(1, std::min<int64_t>(n_ob,
++            (int64_t)(131072 / (16 * KP * 4 + 1))));
++
++    const int64_t per_t = (n_tb + nth - 1) / nth;
++    const int64_t tb0   = std::min<int64_t>(ith * per_t, n_tb);
++    const int64_t tb1   = std::min<int64_t>(tb0 + per_t, n_tb);
++
++#if defined(__AVX2__)
++    for (int64_t ts = tb0; ts < tb1; ts += TSB) {
++        const int64_t te = std::min<int64_t>(ts + TSB, tb1);
++        for (int64_t ob = 0; ob < n_ob; ob += OSB) {
++            const int64_t oe = std::min<int64_t>(ob + OSB, n_ob);
++            for (int64_t ob2 = ob; ob2 < oe; ++ob2) {
++                const int64_t oc0 = ob2 * 16;
++                const float * Wb  = Wt + oc0;   // Wt[k*OCp + oc0 .. +15]
++                for (int64_t tb = ts; tb < te; ++tb) {
++                    const int64_t t0 = tb * TB;
++                    if (t0 + TB > OL) {
++                        // partial tail block (at most one per call): scalar
++                        for (int64_t t = t0; t < OL; ++t) {
++                            for (int64_t oc = oc0; oc < std::min<int64_t>(oc0 + 16, OC); ++oc) {
++                                float acc = has_bias ? bp[oc] : 0.0f;
++                                for (int64_t ic = 0; ic < IC; ++ic) {
++                                    const float * xr = Xp + ic * L + t0;
++                                    for (int64_t kw = 0; kw < K; ++kw) {
++                                        acc += Wt[(ic * K + kw) * OCp + oc] * xr[t - t0 + kw * dil];
++                                    }
++                                }
++                                if (has_res) acc = acc + r_data[oc * OL + t];
++                                if (has_act) acc = (acc > 0.f ? acc : 0.f) + slope * (acc < 0.f ? acc : 0.f);
++                                o_data[oc * OL + t] = acc;
++                            }
++                        }
++                        continue;
++                    }
++                    __m256 a00 = _mm256_setzero_ps(), a01 = _mm256_setzero_ps();
++                    __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps();
++                    __m256 a20 = _mm256_setzero_ps(), a21 = _mm256_setzero_ps();
++                    __m256 a30 = _mm256_setzero_ps(), a31 = _mm256_setzero_ps();
++                    __m256 a40 = _mm256_setzero_ps(), a41 = _mm256_setzero_ps();
++                    __m256 a50 = _mm256_setzero_ps(), a51 = _mm256_setzero_ps();
++                    for (int64_t ic = 0; ic < IC; ++ic) {
++                        // pointer-increment addressing: the per-kw address
++                        // chains are 1-cycle adds (imul-on-counter chains were
++                        // measured to gate broadcast dispatch and cost ~26%)
++                        const float * xp = Xp + ic * L + t0;
++                        const float * wp = Wb + ic * K * OCp;
++                        for (int kw = 0; kw < K; ++kw, xp += dil, wp += OCp) {
++                            const __m256 w0 = _mm256_load_ps(wp);
++                            const __m256 w1 = _mm256_load_ps(wp + 8);
++                            a00 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 0), w0, a00);
++                            a01 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 0), w1, a01);
++                            a10 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 1), w0, a10);
++                            a11 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 1), w1, a11);
++                            a20 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 2), w0, a20);
++                            a21 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 2), w1, a21);
++                            a30 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 3), w0, a30);
++                            a31 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 3), w1, a31);
++                            a40 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 4), w0, a40);
++                            a41 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 4), w1, a41);
++                            a50 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 5), w0, a50);
++                            a51 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 5), w1, a51);
++                        }
++                    }
++                    // epilogue: bias + optional leaky; stores are t-contiguous
++                    // per oc (extraction cost is negligible vs KP FMAs/tile)
++                    {
++                        float tmp[TB][8];
++                        for (int64_t j = 0; j < 16; ++j) {
++                            const int64_t oc = oc0 + j;
++                            if (oc >= OC) break;
++                            const int hi = j >= 8 ? 1 : 0;
++                            const int ch = (int)(j & 7);
++                            const float bv = has_bias ? bp[oc] : 0.0f;
++                            _mm256_storeu_ps(&tmp[0][0], hi ? a01 : a00);
++                            _mm256_storeu_ps(&tmp[1][0], hi ? a11 : a10);
++                            _mm256_storeu_ps(&tmp[2][0], hi ? a21 : a20);
++                            _mm256_storeu_ps(&tmp[3][0], hi ? a31 : a30);
++                            _mm256_storeu_ps(&tmp[4][0], hi ? a41 : a40);
++                            _mm256_storeu_ps(&tmp[5][0], hi ? a51 : a50);
++                            for (int64_t i = 0; i < TB; ++i) {
++                                float v = bv + tmp[i][ch];
++                                if (has_res) v = v + r_data[oc * OL + t0 + i];
++                                if (has_act) v = (v > 0.f ? v : 0.f) + slope * (v < 0.f ? v : 0.f);
++                                o_data[oc * OL + t0 + i] = v;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++#else
++    // scalar fallback (no AVX2): same math, per-element
++    for (int64_t tb = tb0; tb < tb1; ++tb) {
++        const int64_t t0 = tb * TB;
++        for (int64_t t = t0; t < std::min<int64_t>(t0 + TB, OL); ++t) {
++            for (int64_t oc = 0; oc < OC; ++oc) {
++                float acc = has_bias ? bp[oc] : 0.0f;
++                for (int64_t ic = 0; ic < IC; ++ic) {
++                    const float * xr = Xp + ic * L + t0;
++                    for (int64_t kw = 0; kw < K; ++kw) {
++                        acc += Wt[(ic * K + kw) * OCp + oc] * xr[t - t0 + kw * dil];
++                    }
++                }
++                if (has_res) acc = acc + r_data[oc * OL + t];
++                if (has_act) acc = (acc > 0.f ? acc : 0.f) + slope * (acc < 0.f ? acc : 0.f);
++                o_data[oc * OL + t] = acc;
++            }
++        }
++    }
++#endif
++}
++
  // ggml_compute_forward_rwkv_wkv6
  
  static void ggml_compute_forward_rwkv_wkv6_f32(
 diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
-index 4c1642a..20099eb 100644
+index 4c1642a..07f830b 100644
 --- a/src/ggml-cpu/ops.h
 +++ b/src/ggml-cpu/ops.h
 @@ -66,6 +66,7 @@ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, s
@@ -613,6 +1165,16 @@ index 4c1642a..20099eb 100644
  void ggml_compute_forward_upscale(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_pad(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_pad_reflect_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+@@ -119,6 +122,9 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
+ void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++// learned-ops patch (HiFiGAN vocoder fusion)
++void ggml_compute_forward_add_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_conv_direct_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ #ifdef __cplusplus
+ }
+ #endif
 diff --git a/src/ggml-cuda/conv-transpose-1d.cu b/src/ggml-cuda/conv-transpose-1d.cu
 index ebf2aa8..d319974 100644
 --- a/src/ggml-cuda/conv-transpose-1d.cu
@@ -1257,10 +1819,10 @@ index c93d6ee..347155c 100644
      string_to_spv("col2im_1d_f16",  "col2im_1d.comp", {{"DATA_A_F16", "1"},  {"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
      string_to_spv("col2im_1d_bf16", "col2im_1d.comp", {{"DATA_A_BF16", "1"}, {"A_TYPE", "uint16_t"},  {"D_TYPE", "uint16_t"}});
 diff --git a/src/ggml.c b/src/ggml.c
-index da7f3a5..1ecd7cb 100644
+index da7f3a5..38616ac 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
-@@ -1098,9 +1098,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1098,9 +1098,16 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "OPT_STEP_SGD",
  
      "GLU",
@@ -1268,14 +1830,17 @@ index da7f3a5..1ecd7cb 100644
 +    "IM2COL_FAST_1D",
 +    "SCATTER_ELEMENTS",
 +    "REL_POS_BIAS",
++
++    "ADD_LEAKY_RELU",
++    "CONV_DIRECT_1D",
  };
  
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1213,9 +1217,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1213,9 +1220,16 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "sgd(x)",
  
      "glu(x)",
@@ -1283,14 +1848,17 @@ index da7f3a5..1ecd7cb 100644
 +    "im2col_fast_1d(x)",
 +    "scatter_elements(data, idx, upd)",
 +    "rel_pos_bias(x, wcat)",
++
++    "add_leaky_relu(a,b,slope)",
++    "conv_direct_1d(w,x,b,pad,dil,slope)",
  };
  
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -3932,6 +3940,54 @@ struct ggml_tensor * ggml_get_rows_back(
+@@ -3932,6 +3946,54 @@ struct ggml_tensor * ggml_get_rows_back(
      return result;
  }
  
@@ -1345,7 +1913,7 @@ index da7f3a5..1ecd7cb 100644
  // ggml_set_rows
  
  struct ggml_tensor * ggml_set_rows(
-@@ -4537,6 +4593,49 @@ struct ggml_tensor * ggml_conv_1d(
+@@ -4537,6 +4599,88 @@ struct ggml_tensor * ggml_conv_1d(
      return result;
  }
  
@@ -1356,7 +1924,7 @@ index da7f3a5..1ecd7cb 100644
 +// The CPU specialization reduces each output row to an O(1) valid input
 +// window with head/tail zero-fill and memcpy when dilation == 1.
 +
-+static struct ggml_tensor * ggml_im2col_fast_1d(
++static struct ggml_tensor * ggml_im2col_fast_1d_impl(
 +        struct ggml_context * ctx,
 +        struct ggml_tensor  * a,
 +        struct ggml_tensor  * b,
@@ -1373,6 +1941,45 @@ index da7f3a5..1ecd7cb 100644
 +    return result;
 +}
 +
++// Public 1D form (stride/padding/dilation + explicit dst_type).  Keeps an F32
++// im2col buffer available for precision-sensitive paths.
++// ow_align > 1 rounds the output length UP to a multiple of ow_align: rows in
++// [OW, align_up(OW)) are computed from partially out-of-range windows (the
++// kernel zero-fills), which is numerically identical to conv zero padding for
++// the valid rows, so the caller can crop them with a free view.  This exists
++// so GEMM-friendly lengths (e.g. multiples of 16 for the CPU tinyBLAS tiling)
++// can be enforced without touching the input tensor.
++struct ggml_tensor * ggml_im2col_fast_1d(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        int                   s0,
++        int                   p0,
++        int                   d0,
++        enum ggml_type        dst_type,
++        int                   ow_align) {
++    GGML_ASSERT(b->ne[1] == a->ne[1]);
++    GGML_ASSERT(b->ne[3] == 1);
++    GGML_ASSERT(ow_align >= 1);
++
++    const int64_t OW = ggml_calc_conv_output_size(b->ne[0], a->ne[0], s0, p0, d0);
++    int64_t OWp = OW;
++    if (ow_align > 1) {
++        OWp = (OW + ow_align - 1) / ow_align * ow_align;
++    }
++    GGML_ASSERT(OW > 0 && "b too small compared to a");
++
++    const int64_t ne[4] = { a->ne[1] * a->ne[0], OWp, b->ne[2], 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, dst_type, 4, ne);
++    int32_t params[] = { s0, 0, p0, 0, d0, 0, 0 };
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_IM2COL_FAST_1D;
++    result->src[0] = a;
++    result->src[1] = b;
++    return result;
++}
++
 +struct ggml_tensor * ggml_conv_1d_fast_1d_im2col(
 +        struct ggml_context * ctx,
 +        struct ggml_tensor  * a,
@@ -1380,7 +1987,7 @@ index da7f3a5..1ecd7cb 100644
 +        int                   s0,
 +        int                   p0,
 +        int                   d0) {
-+    struct ggml_tensor * im2col = ggml_im2col_fast_1d(ctx, a, b, s0, 0, p0, 0, d0, 0, false, a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16); // [N, OL, IC * K]
++    struct ggml_tensor * im2col = ggml_im2col_fast_1d_impl(ctx, a, b, s0, 0, p0, 0, d0, 0, false, a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16); // [N, OL, IC * K]
 +
 +    struct ggml_tensor * result =
 +        ggml_mul_mat(ctx,
@@ -1395,7 +2002,7 @@ index da7f3a5..1ecd7cb 100644
  // ggml_conv_1d_ph
  
  struct ggml_tensor* ggml_conv_1d_ph(
-@@ -4616,31 +4715,40 @@ struct ggml_tensor * ggml_col2im_1d(
+@@ -4616,31 +4760,40 @@ struct ggml_tensor * ggml_col2im_1d(
  
  // ggml_conv_transpose_1d
  
@@ -1446,7 +2053,7 @@ index da7f3a5..1ecd7cb 100644
      ggml_set_op_params(result, params, sizeof(params));
  
      result->op     = GGML_OP_CONV_TRANSPOSE_1D;
-@@ -4650,6 +4758,16 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
+@@ -4650,6 +4803,16 @@ GGML_API struct ggml_tensor * ggml_conv_transpose_1d(
      return result;
  }
  
@@ -1463,7 +2070,7 @@ index da7f3a5..1ecd7cb 100644
  // ggml_conv_2d
  
  // a: [OC，IC, KH, KW]
-@@ -5758,6 +5876,40 @@ struct ggml_tensor * ggml_add_rel_pos_inplace(
+@@ -5758,6 +5921,138 @@ struct ggml_tensor * ggml_add_rel_pos_inplace(
      return ggml_add_rel_pos_impl(ctx, a, pw, ph, true);
  }
  
@@ -1501,10 +2108,108 @@ index da7f3a5..1ecd7cb 100644
 +    return result;
 +}
 +
++// ggml_add_leaky_relu
++
++struct ggml_tensor * ggml_add_leaky_relu(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        float                 slope) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(b->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_is_contiguous(b));
++    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);   // 2D [T, C]
++    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
++    GGML_ASSERT(b->ne[1] == a->ne[1]);              // same channel count
++    GGML_ASSERT(b->ne[0] == 1 || b->ne[0] == a->ne[0]); // broadcast or elementwise
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1]);
++
++    ggml_set_op_params(result, &slope, sizeof(float));
++
++    result->op     = GGML_OP_ADD_LEAKY_RELU;
++    result->src[0] = a;
++    result->src[1] = b;
++
++    return result;
++}
++
++// ggml_conv_direct_1d
++
++struct ggml_tensor * ggml_conv_direct_1d(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * bias,
++        int                   pad,
++        int                   dil,
++        float                 leaky_slope) {
++    return ggml_conv_direct_1d_fused(ctx, w, x, bias, NULL, pad, dil, leaky_slope, 1.0f, 0.0f);
++}
++
++// full-featured variant: optional residual add (epilogue) and optional input
++// scaling/leaky (applied while packing the padded X copy in work data, so the
++// standalone SCALE / LEAKY_RELU producers of x can be skipped bit-identically)
++struct ggml_tensor * ggml_conv_direct_1d_fused(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * bias,
++        struct ggml_tensor  * res,
++        int                   pad,
++        int                   dil,
++        float                 leaky_slope,
++        float                 in_scale,
++        float                 in_slope) {
++    GGML_ASSERT(w->type == GGML_TYPE_F32);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(res == NULL || res->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(pad >= 0);
++    GGML_ASSERT(dil >= 1);
++
++    const int64_t K  = w->ne[0];
++    const int64_t IC = w->ne[1];
++    const int64_t OC = w->ne[2];
++    const int64_t T  = x->ne[0];
++    GGML_ASSERT(x->ne[1] == IC);
++    GGML_ASSERT(bias == NULL || bias->ne[0] == OC);
++    const int64_t OL = T + 2*pad - dil*(K - 1);
++    GGML_ASSERT(OL > 0);
++    // residual must match the output exactly (same-shape [OL, OC], contiguous)
++    if (res != NULL) {
++        GGML_ASSERT(ggml_is_contiguous(res));
++        GGML_ASSERT(res->ne[0] == OL && res->ne[1] == OC);
++    }
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, OL, OC);
++
++    // op_params layout (7 x int32):
++    //   [0] pad, [1] dil, [2] leaky_slope (f32), [3] has_bias,
++    //   [4] in_scale (f32), [5] in_slope (f32), [6] has_res
++    int32_t params[7] = { pad, dil };
++    memcpy(&params[2], &leaky_slope, sizeof(float));
++    params[3] = bias != NULL;
++    memcpy(&params[4], &in_scale, sizeof(float));
++    memcpy(&params[5], &in_slope, sizeof(float));
++    params[6] = res != NULL;
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_CONV_DIRECT_1D;
++    result->src[0] = w;
++    result->src[1] = x;
++    result->src[2] = bias;
++    result->src[3] = res;
++
++    return result;
++}
++
  // ggml_rwkv_wkv6
  
  struct ggml_tensor * ggml_rwkv_wkv6(
-@@ -6981,7 +7133,8 @@ static void ggml_compute_backward(
+@@ -6981,7 +7276,8 @@ static void ggml_compute_backward(
              }
              GGML_ASSERT((!src2 || !src2_needs_grads) && "gradients for freq factors not implemented");
          } break;
@@ -1514,7 +2219,7 @@ index da7f3a5..1ecd7cb 100644
              if (src1_needs_grads) {
                  const int32_t s0    = ggml_get_op_params_i32(tensor, 0);
                  const int32_t s1    = ggml_get_op_params_i32(tensor, 1);
-@@ -7241,8 +7394,9 @@ void ggml_build_backward_expand(
+@@ -7241,8 +7537,9 @@ void ggml_build_backward_expand(
          bool ignore_src[GGML_MAX_SRC] = {false};
          switch (node->op) {
              // gradients in node->src[0] for one reason or another have no effect on output gradients
@@ -1881,21 +2586,26 @@ index 0000000..4573203
 +}
 diff --git a/tests-learned/test_learned_ops.c b/tests-learned/test_learned_ops.c
 new file mode 100644
-index 0000000..573308f
+index 0000000..62dd987
 --- /dev/null
 +++ b/tests-learned/test_learned_ops.c
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,647 @@
 +// Smoke tests for the learned-ops patch (ggml v0.19.0 base).
 +// Verifies, against hand-rolled references:
 +//   1. ggml_conv_1d_fast_1d_im2col == ggml_conv_1d        (CPU reference kernels)
 +//   2. ggml_conv_transpose_1d_ext  == naive reference     (output_padding, groups, padding)
 +//   3. ggml_scatter_elements       == naive reference     (overwrite / add, axis 0/1)
 +//   4. ggml_rel_pos_bias           == naive reference
++//   5. ggml_conv_direct_1d[_fused] == naive reference     (pad/dil/bias/leaky, residual,
++//                                                          input scale/leaky fusions,
++//                                                          non-multiple-of-16 OC, tails)
++//   6. ggml_add_leaky_relu         == add + leaky_relu   (broadcast [1,C] and rowwise [T,C] bias)
 +//
 +// Usage: test_learned_ops [cpu|vk]
 +// (vk builds link ggml-vulkan and run every case on device 0; cases the
 +//  backend reports as unsupported are skipped - on Vulkan that is convT
-+//  with p0 != 0 / d0 != 1 and scatter-add without VK_EXT_shader_atomic_float.)
++//  with p0 != 0 / d0 != 1 and scatter-add without VK_EXT_shader_atomic_float.
++//  conv_direct_1d / add_leaky_relu are CPU-only ops and skip on vk.)
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -2309,6 +3019,204 @@ index 0000000..573308f
 +    printf("  done (%d failures so far)\n", failures);
 +}
 +
++// ---------- 5. conv_direct_1d (+fused variants) ----------
++
++// naive reference for ggml_conv_direct_1d[_fused]:
++//   out[t, oc] = act( bias[oc] + sum_{ic,kw} w[kw, ic, oc] * xin(t + kw*dil - pad, ic) + res[t, oc] )
++//   xin(t, ic) = act_in( x[t, ic] * in_scale ), zero outside [0, T)
++// x layout [T, IC] contiguous (memory: ic*T + t), w [K, IC, OC] (oc*IC*K),
++// out [OL, OC] (oc*OL + t), OL = T + 2*pad - dil*(K-1).
++static void ref_conv_direct_1d(const float * w, const float * x, const float * b,
++                               const float * res, int K, int IC, int OC, int T,
++                               int pad, int dil, float slope, float in_scale,
++                               float in_slope, float * out, int OL) {
++    for (int oc = 0; oc < OC; oc++) {
++        for (int t = 0; t < OL; t++) {
++            float acc = b ? b[oc] : 0.0f;
++            for (int ic = 0; ic < IC; ic++) {
++                for (int kw = 0; kw < K; kw++) {
++                    const int64_t xi = (int64_t)t + (int64_t)kw*dil - pad;
++                    float xv = 0.0f;
++                    if (xi >= 0 && xi < T) {
++                        xv = x[(size_t)ic*T + xi];
++                        if (in_scale != 1.0f) xv *= in_scale;
++                        if (in_slope != 0.0f) xv = (xv > 0.0f ? xv : 0.0f) + in_slope * (xv < 0.0f ? xv : 0.0f);
++                    }
++                    acc += w[((size_t)oc*IC + ic)*K + kw] * xv;
++                }
++            }
++            if (res) acc = acc + res[(size_t)oc*OL + t];
++            if (slope != 0.0f) acc = (acc > 0.0f ? acc : 0.0f) + slope * (acc < 0.0f ? acc : 0.0f);
++            out[(size_t)oc*OL + t] = acc;
++        }
++    }
++}
++
++static void test_conv_direct_1d(void) {
++    printf("[test] conv_direct_1d / conv_direct_1d_fused vs naive reference\n");
++
++    struct {
++        int OC, IC, K, pad, dil;
++        int bias, res, fused_io;   // case config
++        float slope, in_scale, in_slope;
++    } cases[] = {
++        // basic shapes, plain conv + bias
++        {16,  8, 3, 1, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},
++        {32, 16, 3, 1, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},
++        {30, 13, 3, 1, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},   // OC,IC not multiples of 16
++        {8,   5, 7, 3, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},
++        {17,  9, 11, 5, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},  // odd OC, long kernel
++        {24, 12, 3, 3, 3, 1, 0, 0, 0.0f, 1.0f, 0.0f},   // dilated
++        {24, 12, 7, 10, 5, 1, 0, 0, 0.0f, 1.0f, 0.0f},  // K=7 dil=5
++        {6,   4, 3, 1, 1, 0, 0, 0, 0.0f, 1.0f, 0.0f},   // bias == NULL
++        {16,  8, 3, 0, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},   // pad == 0
++        // output leaky (convs1-style epilogue)
++        {16,  8, 3, 1, 1, 1, 0, 0, 0.1f, 1.0f, 0.0f},
++        {30, 13, 7, 3, 3, 1, 0, 0, 0.1f, 1.0f, 0.0f},
++        // residual (convs2-style epilogue)
++        {16,  8, 3, 1, 1, 1, 1, 0, 0.0f, 1.0f, 0.0f},
++        {30, 13, 3, 1, 1, 1, 1, 0, 0.1f, 1.0f, 0.0f},   // residual + output leaky
++        // producer-side input scale / leaky
++        {16,  8, 3, 1, 1, 1, 0, 1, 0.0f, 0.33333334f, 0.0f},
++        {16,  8, 3, 1, 1, 1, 0, 1, 0.0f, 1.0f, 0.1f},
++        {30, 13, 7, 3, 1, 1, 0, 1, 0.0f, 0.5f, 0.1f},   // scale + leaky + odd OC
++        // everything at once
++        {30, 13, 3, 1, 3, 1, 1, 1, 0.1f, 0.33333334f, 0.1f},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int OC = cases[c].OC, IC = cases[c].IC, K = cases[c].K;
++        const int pad = cases[c].pad, dil = cases[c].dil;
++        // T chosen so OL covers: multiple of 6, remainder 1, remainder 4 (partial tail)
++        const int OL_target = 25 + (int)c;
++        const int T = OL_target + dil*(K-1) - 2*pad;
++        const int OL = T + 2*pad - dil*(K-1);
++        if (T <= 0) continue;
++
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * a  = ggml_new_tensor_3d(t.ctx, GGML_TYPE_F32, K, IC, OC);
++        struct ggml_tensor * b  = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, T, IC);
++        struct ggml_tensor * vb = cases[c].bias
++            ? ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, OC) : NULL;
++        struct ggml_tensor * rr = cases[c].res
++            ? ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, OL, OC) : NULL;
++
++        float * pa = (float *)malloc(ggml_nbytes(a));
++        float * pb = (float *)malloc(ggml_nbytes(b));
++        float * pvb = vb ? (float *)malloc(ggml_nbytes(vb)) : NULL;
++        float * prr = rr ? (float *)malloc(ggml_nbytes(rr)) : NULL;
++        for (int i = 0; i < (int)ggml_nelements(a); i++) pa[i] = (float)((i*7 + (int)c) % 13) * 0.25f - 1.0f;
++        for (int i = 0; i < (int)ggml_nelements(b); i++) pb[i] = (float)((i*11 + (int)c*3) % 17) * 0.2f - 1.5f;
++        if (pvb) for (int i = 0; i < OC; i++) pvb[i] = (float)((i*5) % 7) * 0.5f - 1.0f;
++        if (prr) for (int i = 0; i < (int)ggml_nelements(rr); i++) prr[i] = (float)((i*3 + 2) % 11) * 0.3f - 1.5f;
++
++        struct ggml_tensor * r;
++        if (cases[c].res || cases[c].fused_io) {
++            r = ggml_conv_direct_1d_fused(t.ctx, a, b, vb, rr, pad, dil, cases[c].slope,
++                                          cases[c].in_scale, cases[c].in_slope);
++        } else {
++            r = ggml_conv_direct_1d(t.ctx, a, b, vb, pad, dil, cases[c].slope);
++        }
++        CHECK((int)r->ne[0] == OL && (int)r->ne[1] == OC,
++              "shape (case %zu): got [%lld,%lld] want [%d,%d]",
++              c, (long long)r->ne[0], (long long)r->ne[1], OL, OC);
++
++        if (!tctx_alloc_graph(&t, r, NULL)) {
++            free(pa); free(pb); free(pvb); free(prr); tctx_end(&t); continue;
++        }
++        tctx_upload(&t, a, pa);
++        tctx_upload(&t, b, pb);
++        if (vb) tctx_upload(&t, vb, pvb);
++        if (rr) tctx_upload(&t, rr, prr);
++        tctx_compute(&t);
++
++        float * out = (float *)malloc(ggml_nbytes(r));
++        tctx_download(&t, r, out);
++
++        float * ref = (float *)malloc((size_t)OL * OC * sizeof(float));
++        ref_conv_direct_1d(pa, pb, pvb, prr, K, IC, OC, T, pad, dil,
++                           cases[c].slope, cases[c].in_scale, cases[c].in_slope, ref, OL);
++        CHECK(vec_close(out, ref, OL*OC, 1e-4f),
++              "conv_direct_1d differs (case %zu: OC%d IC%d K%d p%d d%d bias%d res%d io%d)",
++              c, OC, IC, K, pad, dil, cases[c].bias, cases[c].res, cases[c].fused_io);
++
++        free(pa); free(pb); free(pvb); free(prr); free(out); free(ref);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
++// ---------- 6. add_leaky_relu ----------
++
++static void test_add_leaky_relu(void) {
++    printf("[test] add_leaky_relu vs add + leaky_relu (broadcast and rowwise bias)\n");
++
++    struct {
++        int T, C;
++        float slope;
++        int rowwise;   // 0: bias [1, C] broadcast; 1: bias [T, C] elementwise
++    } cases[] = {
++        {37, 16,  0.1f, 0},
++        {37, 16,  0.1f, 1},
++        {25, 5,   0.1f, 0},   // C < nth / odd shapes (flat fallback path)
++        {25, 5,   0.1f, 1},
++        {64, 128, 0.01f, 0},
++        {64, 128, 0.01f, 1},
++        {61, 33,  0.1f, 0},   // odd C, odd T
++        {61, 33,  0.1f, 1},
++    };
++
++    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
++        const int T = cases[c].T, C = cases[c].C;
++        struct tctx t;
++        tctx_begin(&t);
++
++        struct ggml_tensor * a = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, T, C);
++        struct ggml_tensor * b = cases[c].rowwise
++            ? ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, T, C)
++            : ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 1, C);
++
++        float * pa = (float *)malloc(ggml_nbytes(a));
++        float * pb = (float *)malloc(ggml_nbytes(b));
++        for (int i = 0; i < (int)ggml_nelements(a); i++) pa[i] = (float)((i*7 + (int)c) % 13) * 0.3f - 1.8f;
++        for (int i = 0; i < (int)ggml_nelements(b); i++) pb[i] = (float)((i*5 + 1) % 9) * 0.4f - 1.6f;
++
++        // fused op and the composed stock path, same graph
++        struct ggml_tensor * r1 = ggml_add_leaky_relu(t.ctx, a, b, cases[c].slope);
++        struct ggml_tensor * r2 = ggml_leaky_relu(t.ctx, ggml_add(t.ctx, a, b), cases[c].slope, false);
++
++        if (!tctx_alloc_graph(&t, r1, r2)) { free(pa); free(pb); tctx_end(&t); continue; }
++        tctx_upload(&t, a, pa);
++        tctx_upload(&t, b, pb);
++        tctx_compute(&t);
++
++        float * o1 = (float *)malloc(ggml_nbytes(r1));
++        float * o2 = (float *)malloc(ggml_nbytes(r2));
++        tctx_download(&t, r1, o1);
++        tctx_download(&t, r2, o2);
++
++        // exact expression contract: (v>0?v:0) + s*(v<0?v:0)
++        float * ref = (float *)malloc((size_t)T * C * sizeof(float));
++        for (int ic = 0; ic < C; ic++) {
++            for (int it = 0; it < T; it++) {
++                const size_t i = (size_t)ic*T + it;
++                const float v = pa[i] + (cases[c].rowwise ? pb[i] : pb[ic]);
++                ref[i] = (v > 0.0f ? v : 0.0f) + cases[c].slope * (v < 0.0f ? v : 0.0f);
++            }
++        }
++        CHECK(vec_close(o1, ref, T*C, 1e-5f), "add_leaky_relu differs from reference (case %zu: T%d C%d rowwise%d)",
++              c, T, C, cases[c].rowwise);
++        CHECK(vec_close(o1, o2, T*C, 1e-4f), "add_leaky_relu differs from add+leaky (case %zu: T%d C%d rowwise%d)",
++              c, T, C, cases[c].rowwise);
++
++        free(pa); free(pb); free(o1); free(o2); free(ref);
++        tctx_end(&t);
++    }
++    printf("  done (%d failures so far)\n", failures);
++}
++
 +int main(int argc, char ** argv) {
 +    if (argc > 1) {
 +        g_backend = argv[1];
@@ -2319,6 +3227,8 @@ index 0000000..573308f
 +    test_conv_transpose_1d_ext();
 +    test_scatter_elements();
 +    test_rel_pos_bias();
++    test_conv_direct_1d();
++    test_add_leaky_relu();
 +
 +    if (failures == 0) {
 +        printf("\nALL PASSED\n");

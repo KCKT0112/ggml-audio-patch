@@ -2,9 +2,9 @@
 
 > 中文 | **[English](README.md)**
 
-一套精选补丁，把来自 ggml 生态不同项目的**十四个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：API 对齐上游规范、修复了原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持。以三个顺序应用的统一 diff + 正确性测试 + 跨后端基准程序交付。
+一套精选补丁，把**十六个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：十四个取自 ggml 生态不同项目——API 对齐上游规范、修复原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持；另有两个为 NSF-HiFiGAN 声码器在本仓库新写（融合 bias 加 + leaky ReLU；带生产侧融合的 stride-1 直接 1D 卷积）。以四个统一 diff 交付（按序应用，Metal 补丁可按平台跳过），另附正确性测试与跨后端基准程序。
 
-## 补丁一：四个 learned 算子
+## 补丁一：六个 learned 算子
 
 | 算子 | 学习来源 | 价值 |
 |---|---|---|
@@ -12,6 +12,8 @@
 | `ggml_conv_transpose_1d_ext` | [mmwillet/TTS.cpp](https://github.com/mmwillet/TTS.cpp)（ggml `support-for-tts` 分支） | 与 PyTorch `ConvTranspose1d` 全参数对齐：**groups / output_padding / padding**；并修复其损坏的 CPU 分组路径、CUDA `op_params` 读错位与除零断言。 |
 | `GGML_OP_REL_POS_BIAS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR)（ggml 的 R 绑定） | BoTNet 风格双轴相对位置注意力偏置：按轴查位移表 + 逐通道点积，含 CPU 与 Vulkan 实现。 |
 | `GGML_OP_SCATTER_ELEMENTS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR) | ONNX `ScatterElements` 语义——`get_rows` 的逆操作。Vulkan 端用 `VK_EXT_shader_atomic_float` 原子加实现累加归约。 |
+| `GGML_OP_ADD_LEAKY_RELU` | 为 [pc-nsf-hifigan.cpp](https://github.com/KakaruHayate/pc-nsf-hifigan.cpp)（NSF-HiFiGAN 声码器）新写 | `y = leaky(a + b)` 单次遍历——广播 `[1,C]` 或逐行 `[T,C]` bias；与 `add` + `leaky_relu` 组合逐位一致。同时把原生 CPU `leaky_relu` 内核并行化（上游强制 `n_tasks = 1`）。 |
+| `GGML_OP_CONV_DIRECT_1D`（含 `_fused`） | 为 pc-nsf-hifigan.cpp 新写 | stride-1 直接 1D 卷积、无 im2col scratch：权重每次调用打包成 `[IC·K, OCp]`，AVX2 6×16 微内核 + 指针递增寻址（单线程比 `imul` 索引快 26%）。`_fused` 把 bias / 残差 / 输出 leaky 与输入侧 `leaky·scale` **逐位一致**地折入——全声码器 2.1×（10.0 s → 4.8 s，24 线程，16C/32T）。 |
 
 ## 补丁二：十个 qvac 融合算子
 
@@ -78,7 +80,7 @@ git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch     # 补丁三�
 
 配置 / 编译 / 测试见 **[docs/building_zh.md](docs/building_zh.md)**（含 Vulkan SDK、CUDA 工具链、Windows 生成器选择等注意事项），或直接跑 `scripts/build-and-test.sh` / `build-and-test.ps1`。
 
-性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.80×；Snake 在 Metal 达 3.05×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.24×。）
+性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×；`CONV_DIRECT_1D`+融合在全 NSF-HiFiGAN 声码器上 2.1×（10 038 → 4 764 ms，16C/32T Xeon E5-2675 v3、24 线程），与 im2col 路径逐位同级。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.80×；Snake 在 Metal 达 3.05×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.24×；affine_prelu Vulkan 最高 6.3×；gru 补上 RNN 空缺，CPU H512×B4×L32 约 47 ms。）
 
 ## 后端支持矩阵
 
@@ -90,6 +92,8 @@ git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch     # 补丁三�
 | `conv_transpose_1d_ext` | ✅ 全参数 | ✅ `p0=0, d0=1`（分组 ✓） | ✅ 全参数 | ⚠️ 仅 `g0=1, p0=0` |
 | `REL_POS_BIAS` | ✅ | ✅ | —（回落 CPU） | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅（add 需 `shaderBufferFloat32AtomicAdd`） | — | — |
+| `ADD_LEAKY_RELU` | ✅ | —（回落 CPU） | — | — |
+| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | —（回落 CPU） | — | — |
 
 补丁二：
 
