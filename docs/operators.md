@@ -228,7 +228,7 @@ Snake activation from ACE-Step's Oobleck VAE. On Vulkan this port **reuses the u
 | `AFFINE_PRELU` | ✅ | ✅ | — | — |
 | `SNAKE` | ✅ | ✅ | — | — |
 
-Upstream qvac implements the supertonic five as Metal kernels (`kernel_supertonic_*_f32`) and the other five as Vulkan shaders; this port keeps the Vulkan five, gates Metal/CUDA off for all ten (clean CPU fallback), and notes the Metal kernels as porting reference.
+Upstream qvac implements the supertonic five as Metal kernels (`kernel_supertonic_*_f32`) and the other five as Vulkan shaders; within patch 2 this port keeps the Vulkan five and gates Metal/CUDA off for all ten (clean CPU fallback) — the donor Metal kernels are wired in separately by patch 3.
 
 ## Patch-2 upstream follow-up suggestions
 

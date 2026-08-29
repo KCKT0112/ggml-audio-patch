@@ -12,7 +12,6 @@ document, this file wins.**
 | `patches/*.patch` | **Generated artifact** | Nobody, by hand. Regenerate from a git worktree of a patched ggml tree (`git diff` between the base and patched commits), then verify by `git apply --check` on a clean v0.19.0 checkout. |
 | `tests/*.c` | Contract + harness | Reference functions and expected values are the **frozen contract** (see below). Harness/backend plumbing may be extended. |
 | `bench_*_ops.c` output values quoted in `docs/` | Measured data | Only update from a real run; state device, CPU, toolchain, and repeat policy. Never extrapolate or invent numbers. |
-| `metal-reference/*` | **Frozen upstream extract** | Kernel math and kargs field order are immutable (see below). |
 | `docs/*` | Prose | Open, but keep English + `_zh` pairs in sync. |
 | `scripts/*` | Tooling | Open. Never commit machine-specific absolute paths. |
 | `LICENSE`, `.gitattributes`, `.gitignore` | Repo meta | Maintainer-only. |
@@ -33,32 +32,21 @@ document, this file wins.**
 2. **Test reference functions and expected values.** Never edit a reference
    computation or tolerance to make a failing test pass. Fix the kernel.
 
-3. **`metal-reference/supertonic_ops.metal` kernel bodies** are extracted
-   verbatim from the MIT-licensed upstream (tetherto/qvac-ext-ggml, speech
-   branch). Do not refactor, rename, or "clean up" them. If a kernel does
-   not compile against the baseline, adapt the *integration glue* and record
-   the adaptation in your PR description. If you believe the kernel math
-   itself is wrong, prove it with the test harness first.
-
-4. **`metal-reference/host-side.cpp` kargs struct field order** is part of
-   the host↔shader ABI (Metal binds `constant` structs positionally). The
-   order must stay in lock-step with the kernels. Adding a trailing field is
-   a coordinated change across both files plus the CPU `op_params` doc.
-
-5. **`supports_op` gating discipline.** Never return `true` for an
+3. **`supports_op` gating discipline.** Never return `true` for an
    (op, shape) combination that is not covered by a passing test case on the
    target backend. A wrong kernel is worse than a CPU fallback. When unsure,
    gate it off.
 
-6. **Patch application order.** `qvac-ops-ggml0190.patch` applies only on
+4. **Patch application order.** `qvac-ops-ggml0190.patch` applies only on
    top of `learned-ops-ggml0190.patch`. Don't create "patch-2-only" variants
    without renaming and re-basing.
 
 ## Explicitly allowed
 
-- Adding a Metal (or other backend) integration for the ten qvac operators,
-  following `docs/metal-porting.md`, as a **separate patch file**
-  (`metal-ops-ggml0190.patch`) or PR — do not silently mutate patch 2.
+- Adding a new-backend integration for the ten qvac operators as a
+  **separate patch file** or PR — do not silently mutate patch 2. If you
+  cannot verify on the target platform locally, package the work for
+  delegation as described in [docs/task-package.md](docs/task-package.md).
 - Extending test harnesses (new backends, new cases, new tolerances only
   where a documented fp-accuracy reason exists).
 - Adding benchmark cases and updating docs with your measured numbers.

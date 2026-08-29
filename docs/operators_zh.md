@@ -227,7 +227,7 @@ ACE-Step Oobleck VAE 的 snake 激活。Vulkan 端本移植**直接复用上游 
 | `AFFINE_PRELU` | ✅ | ✅ | — | — |
 | `SNAKE` | ✅ | ✅ | — | — |
 
-上游 qvac 中 supertonic 五件套是 Metal 内核（`kernel_supertonic_*_f32`）、后五件是 Vulkan shader；本移植保留 Vulkan 五件套，Metal/CUDA 全部先关闭（干净回落 CPU），Metal 内核留作移植参考。
+上游 qvac 中 supertonic 五件套是 Metal 内核（`kernel_supertonic_*_f32`）、后五件是 Vulkan shader；补丁二范围内本移植保留 Vulkan 五件套、Metal/CUDA 全部关闭（干净回落 CPU）——供体 Metal 内核由补丁三另行接入。
 
 ## 补丁二上游跟进建议
 

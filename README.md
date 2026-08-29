@@ -51,9 +51,6 @@ ggml-audio-patch/
 │   ├── test_qvac_ops.c              # patch-2 correctness smoke tests (cpu | vk | metal harness hook)
 │   ├── bench_learned_ops.c          # patch-1 CPU / Vulkan / CUDA micro-benchmarks
 │   └── bench_qvac_ops.c             # patch-2 fused-vs-composed benchmarks (CPU + Vulkan + Metal)
-├── metal-reference/                 # frozen upstream source used by patch 3 (see docs/metal-porting.md)
-│   ├── supertonic_ops.metal         # 6 kernels verbatim from qvac (MIT), frozen reference
-│   └── host-side.cpp                # kargs structs, pipeline lookup, dispatchers, supports_op gates
 ├── scripts/
 │   ├── build-and-test.sh            # Linux/macOS one-shot build + test
 │   └── build-and-test.ps1           # Windows (pwsh) one-shot build + test
@@ -62,8 +59,9 @@ ggml-audio-patch/
     ├── building.md / building_zh.md            # build prerequisites & instructions
     ├── benchmarks.md / benchmarks_zh.md        # measured performance & methodology
     ├── operators.md / operators_zh.md          # per-operator design notes & API
-    ├── metal-porting.md / metal-porting_zh.md  # Metal integration + verification + acceptance criteria
-    └── porting-notes.md / porting-notes_zh.md  # known pitfalls when porting further
+    ├── metal-porting.md / metal-porting_zh.md  # Metal integration notes: status, harness, gotchas, verified delivery
+    ├── porting-notes.md / porting-notes_zh.md  # known pitfalls when porting further
+    └── task-package.md / task-package_zh.md    # how platform-bound work is packaged & delegated
 ```
 
 ## Quick start
@@ -108,7 +106,7 @@ Patch 2:
 | `AFFINE_PRELU` | ✅ | ✅ | — | — |
 | `SNAKE` | ✅ | ✅ | — | ✅ F32 |
 
-(Patch 3 wires the donor's five Supertonic Metal kernels and direct Snake dispatch. The other four qvac ops have no donor Metal kernel and remain explicitly gated off. Frozen sources, integration notes, verification evidence, and acceptance criteria are in [`metal-reference/`](metal-reference/) and [docs/metal-porting.md](docs/metal-porting.md). CUDA remains gated off, matching the donor. Contribution/editing boundaries: [AGENTS.md](AGENTS.md).)
+(Patch 3 wires the donor's five Supertonic Metal kernels and direct Snake dispatch. The other four qvac ops have no donor Metal kernel and remain explicitly gated off. Integration notes and verification evidence are in [docs/metal-porting.md](docs/metal-porting.md). CUDA remains gated off, matching the donor. Contribution/editing boundaries: [AGENTS.md](AGENTS.md). How this port was packaged and delegated without local Apple hardware: [docs/task-package.md](docs/task-package.md).)
 
 Unsupported parameter combinations are rejected by each backend's `supports_op`, so graphs fall back to the CPU backend cleanly instead of producing wrong results.
 

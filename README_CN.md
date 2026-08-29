@@ -51,9 +51,6 @@ ggml-audio-patch/
 │   ├── test_qvac_ops.c              # 补丁二正确性测试（cpu | vk | metal 挂具钩子）
 │   ├── bench_learned_ops.c          # 补丁一 CPU / Vulkan / CUDA 微基准
 │   └── bench_qvac_ops.c             # 补丁二 融合 vs 组合图 基准（CPU + Vulkan + Metal）
-├── metal-reference/                 # 补丁三采用的冻结上游来源（见 docs/metal-porting_zh.md）
-│   ├── supertonic_ops.metal         # 6 个 kernel，逐字取自 qvac（MIT），冻结参考
-│   └── host-side.cpp                # kargs 结构体、pipeline 查找、分发函数、supports_op 门控
 ├── scripts/
 │   ├── build-and-test.sh            # Linux/macOS 一键构建+测试
 │   └── build-and-test.ps1           # Windows (pwsh) 一键构建+测试
@@ -62,8 +59,9 @@ ggml-audio-patch/
     ├── building.md / building_zh.md            # 构建须知
     ├── benchmarks.md / benchmarks_zh.md        # 性能测试与方法论
     ├── operators.md / operators_zh.md          # 各算子设计笔记与 API
-    ├── metal-porting.md / metal-porting_zh.md  # Metal 集成步骤 + 验证方法 + 验收标准
-    └── porting-notes.md / porting-notes_zh.md  # 移植坑与修复记录
+    ├── metal-porting.md / metal-porting_zh.md  # Metal 集成笔记：状态、挂具、坑、已验证交付
+    ├── porting-notes.md / porting-notes_zh.md  # 移植坑与修复记录
+    └── task-package.md / task-package_zh.md    # 平台绑定任务如何打包下发
 ```
 
 ## 快速开始
@@ -108,7 +106,7 @@ git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch     # 补丁三�
 | `AFFINE_PRELU` | ✅ | ✅ | — | — |
 | `SNAKE` | ✅ | ✅ | — | ✅ F32 |
 
-（补丁三接入供体的五个 Supertonic Metal kernel 和直接 Snake 分发；另外四个 qvac 算子没有供体 Metal kernel，仍显式关闭。冻结来源、集成说明、验证证据和验收标准见 [`metal-reference/`](metal-reference/) 与 [docs/metal-porting_zh.md](docs/metal-porting_zh.md)。CUDA 仍关闭，与供体一致。贡献与编辑边界：[AGENTS.md](AGENTS.md)。）
+（补丁三接入供体的五个 Supertonic Metal kernel 和直接 Snake 分发；另外四个 qvac 算子没有供体 Metal kernel，仍显式关闭。集成笔记与验证证据见 [docs/metal-porting_zh.md](docs/metal-porting_zh.md)。CUDA 仍关闭，与供体一致。贡献与编辑边界：[AGENTS.md](AGENTS.md)。本轮无本地苹果硬件如何打包下发任务：[docs/task-package_zh.md](docs/task-package_zh.md)。）
 
 不支持的参数组合由各后端 `supports_op` 显式拒绝，计算图会干净地回落到 CPU 后端，而不是产出错误结果。
 
