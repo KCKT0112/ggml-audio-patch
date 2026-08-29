@@ -163,7 +163,11 @@ already embedded in the test — no extra work needed.
   change per AGENTS.md rule 4).
 - **`layer_norm_channel` threadgroup**: `nth` must be a multiple of 32
   (simdgroup) and ≤ 256; the reference dispatcher already computes it that
-  way. Shared memory is `8 * sizeof(float)` — one float per simdgroup.
+  way. Shared memory is `8 * sizeof(float)` — one float per simdgroup. The
+  integrated kernel adds a barrier after every simdgroup consumes the reduced
+  mean and before variance partials reuse `shared[0]`. The donor omitted this
+  barrier; C=256/L=4096 stress testing reproduced wrong results in 9/10
+  independent processes without it and passed 20/20 with it.
 - **`depthwise_1d` peelings are compile-time** on K ∈ {3, 5, 7}; any other
   K falls through the `else` branch treating it as K=3 — the supports_op
   gate must reject other K values (upstream gates on K ∈ {3,5,7}; do the

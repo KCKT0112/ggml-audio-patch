@@ -250,6 +250,10 @@ static void test_supertonic_layer_norm_channel(void) {
         {7, 4, 1e-5f},
         {16, 8, 1e-6f},
         {5, 3, 1e-5f},
+        // Multi-simdgroup stress cases. The large L makes missing barriers in
+        // the shared mean/variance reduction reliably observable on Metal.
+        {4096, 64, 1e-5f},
+        {4096, 256, 1e-5f},
     };
 
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {

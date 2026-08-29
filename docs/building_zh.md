@@ -126,11 +126,11 @@ ALL PASSED
 
 ## 6. 性能基准
 
-`tests/bench_learned_ops.c` 与 `tests/bench_qvac_ops.c` 编译方式同上（按需加 `USE_VULKAN` / `USE_CUDA` 宏）。运行时把对应 DLL 目录加进 `PATH`：
+`tests/bench_learned_ops.c` 与 `tests/bench_qvac_ops.c` 编译方式同上（按需加 `USE_VULKAN` / `USE_CUDA` / `USE_METAL` 宏）。运行时确保对应后端库可用：
 
 ```
 bench_learned_ops [cpu | vulkan | cuda] [threads]
-bench_qvac_ops    [cpu | vulkan] [threads]
+bench_qvac_ops    [cpu | vulkan | metal] [threads]
 ```
 
 取信数据的注意事项（都是踩坑换来的，详见 [benchmarks_zh.md](benchmarks_zh.md) §方法论）：

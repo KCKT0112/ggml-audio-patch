@@ -619,10 +619,10 @@ index b03b59e0..af098e37 100644
  int ggml_metal_op_pad               (ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_pad_reflect_1d    (ggml_metal_op_t ctx, int idx);
 diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
-index 92258b73..356f647d 100644
+index 92258b73..802e2cdd 100644
 --- a/src/ggml-metal/ggml-metal.metal
 +++ b/src/ggml-metal/ggml-metal.metal
-@@ -11601,3 +11601,283 @@ kernel void kernel_dsv4_hc_post_f32(
+@@ -11601,3 +11601,287 @@ kernel void kernel_dsv4_hc_post_f32(
          *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
      }
  }
@@ -772,6 +772,10 @@ index 92258b73..356f647d 100644
 +    }
 +    threadgroup_barrier(mem_flags::mem_threadgroup);
 +    const float mean = shared[0] / (float) C;
++
++    // All simdgroups must consume the mean before shared[0] is reused by the
++    // variance reduction below.
++    threadgroup_barrier(mem_flags::mem_threadgroup);
 +
 +    // ---- Variance ----
 +    float my_sq = 0.0f;

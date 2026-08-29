@@ -100,7 +100,7 @@ Metal 上的正确性无需额外写对照：测试内部已内置手写 CPU 参
 ## 已知坑（来自供体树）
 
 - **kargs 是按位置绑定的 ABI**：Metal 按字段顺序绑定 `constant & args`。host struct 与 kernel struct 必须逐字段一致——不许重排、不许中间插字段（尾部追加需按 AGENTS.md 规则 4 双侧协调）。
-- **`layer_norm_channel` 的 threadgroup**：`nth` 必须是 32（simdgroup）的倍数且 ≤ 256；参考分发函数已经这么算了。共享内存 `8 * sizeof(float)`——每个 simdgroup 一个 float。
+- **`layer_norm_channel` 的 threadgroup**：`nth` 必须是 32（simdgroup）的倍数且 ≤ 256；参考分发函数已经这么算了。共享内存 `8 * sizeof(float)`——每个 simdgroup 一个 float。集成 kernel 在所有 simdgroup 读取归约后的 mean 之后、variance 部分复用 `shared[0]` 之前增加一道 barrier；供体漏了这道同步。C=256/L=4096 压力实验中，未修补版本 10 个独立进程有 9 个结果错误，加入 barrier 后 20/20 通过。
 - **`depthwise_1d` 的展开是编译期的**（K ∈ {3, 5, 7}）；其他 K 会落进按 K=3 处理的 else 分支——supports_op 门控必须拒绝其他 K（上游就是这么门的，照做）。
 - **`bias_gelu` 位兼容**：kernel 用基线的 `erf_approx`（Abramowitz–Stegun/Hastings 多项式，与基线 `kernel_gelu_erf_f32` 同款），而 CPU 参考用 `erff`。测试的 1e-4 容差吸收了多项式差异；**不要**把 kernel "修"成精确 `erff`——那会破坏与未融合 Metal gelu 路径的位一致性。
 - **`snake` 与基线重叠**：v0.19.0 已含供组合图融合使用的泛型 `kernel_snake`。补丁三为直接 `GGML_OP_SNAKE` 分发复用其相同公式和 pipeline，避免重复定义 `kernel_snake_f32` 符号。

@@ -126,11 +126,11 @@ ALL PASSED
 
 ## 6. Benchmarks
 
-`tests/bench_learned_ops.c` and `tests/bench_qvac_ops.c` compile the same way (`USE_VULKAN` / `USE_CUDA` defines). Run with the matching DLLs on `PATH`:
+`tests/bench_learned_ops.c` and `tests/bench_qvac_ops.c` compile the same way (`USE_VULKAN` / `USE_CUDA` / `USE_METAL` defines). Run with the matching backend libraries available:
 
 ```
 bench_learned_ops [cpu | vulkan | cuda] [threads]
-bench_qvac_ops    [cpu | vulkan] [threads]
+bench_qvac_ops    [cpu | vulkan | metal] [threads]
 ```
 
 Notes for trustworthy numbers (all learned the hard way, see [benchmarks.md](benchmarks.md) §Methodology):

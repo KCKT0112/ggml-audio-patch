@@ -80,7 +80,7 @@ Apply the patches in order. Patch 3 is optional on non-Metal platforms; patch 2 
 
 Then configure / build / test — see **[docs/building.md](docs/building.md)** for prerequisites (Vulkan SDK, CUDA toolkit, Windows generator choice) and per-backend commands, or run the bundled `scripts/build-and-test.sh` / `build-and-test.ps1`.
 
-Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path. Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.49× on Apple M4 Metal; Snake reaches 3.90× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.18×.)
+Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path. Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.80× on Apple M4 Metal; Snake reaches 3.05× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.24×.)
 
 ## Backend support matrix
 
