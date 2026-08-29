@@ -96,9 +96,9 @@ Cross-backend (CPU / Vulkan / CUDA) micro-benchmarks produced by `tests/bench_le
 - The CPU kernels are deliberately conservative single-threaded reference implementations (`n_tasks=1`): 1–2.5 GFLOP/s as a semantic fallback. Upstream v0.19.0 has no CPU implementation of either operator at all — this patch adds them from zero; parallelizing them is a contained follow-up if needed.
 - CUDA's `supports_op` correctly returns false, so schedulers fall back to CPU cleanly.
 
-## `ADD_LEAKY_RELU` / `CONV_DIRECT_1D` (vocoder end-to-end + micro-kernel; measured on a second machine)
+## `ADD_LEAKY_RELU` / `CONV_DIRECT_1D` (vocoder end-to-end + micro-kernel)
 
-> Environment for this section only: Xeon E5-2675 v3 (16C/32T Haswell-EP, sustained ~2.0 GHz under AVX2 load), Windows, MSVC 2019 `/O2`, fp32, CPU backend (both ops are CPU-only by design; other backends reject in `supports_op`). Timing = best of 3 full runs. The consumer harness is the pc-nsf-hifigan.cpp `hifigan_cli` (NSF-HiFiGAN: mel=128, 5 upsample levels, 15 resblocks, activations up to `[881664, C]`), accuracy against an ONNX Runtime CPU fp32 reference (4 748 ms on the same machine).
+> Environment for this section only: Xeon E5-2675 v3 (16C/32T Haswell-EP, sustained ~2.0 GHz under AVX2 load), Windows, MSVC 2019 `/O2`, fp32, CPU backend. Timing = 3 runs per path, median quoted. The consumer harness is the pc-nsf-hifigan.cpp `hifigan_cli` (NSF-HiFiGAN: mel=128, 5 upsample levels, 15 resblocks, activations up to `[881664, C]`), accuracy against the torch-CPU fp32 output (offset-aligned; CORR gold = torch-CPU, harness @ f8c16ba). ONNX Runtime CPU EP on the same box: 5 155.0 ms median of 9 runs.
 
 Micro-kernel, single-thread (K=11-shaped direct-conv inner loop, best variant per row):
 
@@ -110,15 +110,20 @@ Micro-kernel, single-thread (K=11-shaped direct-conv inner loop, best variant pe
 
 The 4× gap between calibration and the original kernel is the `inc → movsxd → imul` address chain (≈5 serial cycles per kernel tap) gating `vbroadcastss` dispatch; pointer increments remove it. The residual 2× vs peak is broadcast load-to-use latency on the FMA critical path — a register-resident control variant of the same loop reaches the calibration line, so it is a latency-bound, not bandwidth-bound, residual.
 
-End-to-end vocoder, 24 threads:
+End-to-end vocoder, 24 threads (median of 3):
 
-| path | time | corr vs ORT fp32 | max\|Δ\| |
-|---|---|---|---|
-| stock `im2col` + `mul_mat` (`PCNSF_DIRECT_CONV=0`) | 10 038 ms | 0.99999999 | 1.490e-4 |
-| direct conv + `ADD_LEAKY_RELU`, no producer fusions (`PCNSF_FUSE_IO=0`) | 5 973 ms | 0.99999999 | 1.492e-4 |
-| `conv_direct_1d_fused` (input fold + residual epilogue) | **4 764 ms** | 0.99999999 | 1.492e-4 |
+| path | time (ms) | corr vs torch-CPU fp32 | max\|Δ\| |
+|---|---|---|---|---|
+| stock `im2col` + `mul_mat` (`PCNSF_DIRECT_CONV=0`) | 80 002 | 0.99999999 | 1.490e-4 |
+| direct conv + `ADD_LEAKY_RELU`, no producer fusions (`PCNSF_FUSE_IO=0`) | 31 772 | 0.99999999 | 1.492e-4 |
+| `conv_direct_1d_fused` (input fold + residual epilogue) | **28 030** | 0.99999999 | 1.492e-4 |
 
-All three paths are numerically equivalent (identical rms 9.8e-6; the max|Δ| values differ only in their last digit — FMA-ordering noise). The fused path reaches CPU parity with the ONNX Runtime CPU EP (0.3–1.6% over across runs). Producer-side fusions removed 100 of 252 graph nodes (50 leaky, 5 scale, 45 residual add) with bit-identical output.
+so the direct kernel + fusions are **2.85×** over the stock ggml conv path. All three paths are numerically equivalent (the max|Δ| values differ only in their last digit — FMA-ordering noise). Producer-side fusions removed 100 of 252 graph nodes (50 leaky, 5 scale, 45 residual add) with bit-identical output. Two honest caveats:
+
+- **The ggml CPU path remains ~5.4× slower than ONNX Runtime's CPU EP** (28.0 s vs 5.155 s) on this model; ORT's threaded GEMM on Haswell is simply much better tuned. Thread scaling is weak as well: the fused path takes ~80 s at 4 threads vs 28 s at 24 (2.9× for 6× threads). Closing that gap (better blocking / parallelism breakdown for the level-0 `[881664, 256]`-class activations) is the active workstream; treat the 2.85× as "beats stock ggml", not "competitive with ORT CPU yet".
+- *Errata:* a previous revision of this table listed 10 038 / 5 973 / 4 764 ms for the three rows and claimed ORT-CPU parity. Those numbers were recorded against a stale build configuration and are not reproducible; the table above supersedes them (same machine, same model, re-measured 3-run medians).
+
+For the Vulkan path of the same operator, see the patch-4 section below.
 
 ## Methodology & known traps
 
@@ -230,3 +235,41 @@ Stock ggml has no RNN cell — the comparison column is the *existence* of this 
 6. Same harness rules as patch 1 (fresh backend + galloc per variant, no sched). The Vulkan per-variant lifecycle requirement re-confirmed: reusing a subcontext across graph shapes crashes.
 7. `snake` on Vulkan reuses the stock `snake_f32` pipeline (the v0.19 base already carries a graph-level snake fusion with identical math), so its fused column measures the *op-dispatch* path, not a new shader.
 8. The `channel_shuffle` composed chain on Vulkan/CPU is a near-optimal single-copy — treat its speedup < 1 as "no win where none is possible", not as a defect.
+
+---
+
+# Patch 4 — Vulkan `CONV_DIRECT_1D` (vocoder end-to-end)
+
+> Environment: same box as the vocoder section above (Xeon E5-2675 v3, Windows, MSVC 2019) plus an RTX 2070 (driver 32.0.16.2002; warp 32, 48 KiB shared/block). Stack: ggml v0.19.0 (`30bf868`) + patches 1, 2, and 4 (measured before patch 3 landed upstream; patch 4 is orthogonal to the Metal patch). ggml v0.19.0 + patches 1–3 + pc-nsf-hifigan.cpp @ `f8c16ba` (`hifigan_cli`, branch `wip/profile-nodes`). fp32 end-to-end with tensor cores deliberately off (`GGML_VK_DISABLE_COOPMAT2=1`, set inside `hifigan_cli`): the vocoder contract matches the torch-CPU fp32 path, not tensor-core tf32/fp16 arithmetic. Timing = `PCNSF_TIMING=1` wall time of the model run (excludes WAV IO), reference clip T=1722 (≈37.6 s of audio at 23.5 kHz, 881 664 output samples).
+
+End-to-end (median of each run set):
+
+| path | time (ms) | corr vs torch-CPU fp32 out | max|Δ| |
+|---|---|---|---|
+| ONNX Runtime CPU EP (median of 9) | 5 155.0 | 0.9999999873 | — |
+| ONNX Runtime DML EP (median of 9) | 325.8 | 0.99999697 | 2.09e-03 |
+| ggml Vulkan, patch 4 (all convs via supports_op gate) | **433.2–435.0** | 0.99999985 | 6.13e-04 |
+| ggml Vulkan, `PCNSF_DIRECT_CONV=0` (im2col fallback everywhere) | 571–581 | 0.99999956 | — |
+
+Notes on the Vulkan number: two 3-run sets gave medians 433.2/435.0 (runs 422.6–479.1). A later re-measurement on the same box after a host-only cleanup (debug env hooks removed from `ggml-vulkan.cpp`; shader and graph unchanged, outputs **bit-identical**) read 458–479 ms (median 462, n=4) — the spread is machine-state noise (clocks/thermals after hours of compilation), not a code-path change: identical SPIR-V, identical bytes out. Quote the pair honestly: **≈ 430–480 ms**, DML-class, with an order of magnitude tighter fp32 agreement than DML itself.
+
+Tile-variant sweep (same run, spec-constant variants forced per run; variants change tiling only, outputs bit-identical):
+
+| variant | e16 | e32 | w64 | w128 (shipped pick) | e64 |
+|---|---|---|---|---|---|
+| median ms | 635.6 | 493.9 | 570.1 | 442.0 | 398.2 |
+
+The shipped OC-based pick (≤16→e16, ≤32→e32, else w128) measured best *as a set* in production; a K-aware re-pick suggested by per-shape micro-benchmarks regressed production to 488–1 432 ms and was reverted. Lesson recorded: the variant set is co-tuned; per-shape harness benches do not extrapolate to the full graph.
+
+The `K ≥ 3` gate is a correctness boundary, not a preference: the shader stages `XS_ROWS = 12` input rows per chunk and a `BK = 32` channel-chunk spans `⌊31/K⌋+1` input rows — at K = 2 that is 16 > 11 usable slots, so the circular window overwrites still-needed rows. Production has five K = 2 subpixel-upsample convs; forcing them onto the shader (`PCNSF_DIRECT_MIN_K=1`, bypassing the consumer gate) drops corr to 0.36 deterministically. With the gate they fall back to `im2col`+`mul_mat` (also Vulkan-resident), cost already included in the 433–480 ms above.
+
+Repro (pc-nsf-hifigan.cpp @ `f8c16ba`, `build-vk`, from a clone with patches 1, 2, 4 applied):
+
+```bat
+set GGML_VK_DISABLE_COOPMAT2=1   rem already defaulted inside hifigan_cli
+set HF_RAW_OUT=vulkan_out.f32
+hifigan_cli.exe hifigan_f32.gguf mel.bin f0.bin out.wav
+python cmp_align.py vulkan_out.f32   rem offset-aligned corr vs torch-CPU golden
+```
+
+A 21-case correctness harness (`tools/test_conv_direct.cpp`, includes the production level-0 shapes plus chain/resblock compositions) passes 21/21 with max|Δ| ≤ 5.5e-5 on the Vulkan path vs the CPU `_fused` op.

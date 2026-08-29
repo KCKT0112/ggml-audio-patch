@@ -1,0 +1,663 @@
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 6eb7def..138ac25 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1068,6 +1068,22 @@ struct vk_device_struct {
+     vk_pipeline pipeline_rel_pos_bias_f32;
+     vk_pipeline pipeline_scatter_elements_none;
+     vk_pipeline pipeline_scatter_elements_add;
++    // learned-ops patch: direct stride-1 1D conv (HiFiGAN vocoder), F32 only,
++    // tile variants picked by OC — see ggml_vk_op_get_pipeline.
++    //   e16/e32: BM tracks OC (16/32) so no oc-padding waste on the deepest
++    //            levels; BN=64 keeps shared memory small.
++    //   e64/w64: BM=64; w64 uses WM=16 (8 warps/workgroup, 16/SM) which
++    //            measured fastest for OC >= 64.
++    //   w128: w64 with BN=128 (two t-tiles per workgroup): halves the
++    //            workgroup count per node, so the per-chunk barrier/staging
++    //            machinery, weight re-reads and window loads all amortize
++    //            over twice the output — the chunked phase structure is the
++    //            dominant fixed cost, so this wins wherever it fits.
++    vk_pipeline pipeline_conv_direct_1d_f32_e64;
++    vk_pipeline pipeline_conv_direct_1d_f32_e32;
++    vk_pipeline pipeline_conv_direct_1d_f32_e16;
++    vk_pipeline pipeline_conv_direct_1d_f32_w64;
++    vk_pipeline pipeline_conv_direct_1d_f32_w128;
+     vk_pipeline pipeline_out_prod_f32;
+     vk_pipeline pipeline_snake_f32;
+     vk_pipeline pipeline_snake_f16;
+@@ -1838,6 +1854,23 @@ struct vk_op_rel_pos_bias_push_constants {
+     uint32_t rel_w;   /* 2*W-1 */
+ };
+ 
++// learned-ops patch: must match conv_direct_1d.comp
++struct vk_op_conv_direct_1d_push_constants {
++    uint32_t OL;         /* dst ne[0] */
++    uint32_t T;          /* x ne[0] */
++    uint32_t IC;         /* x ne[1] == w ne[1] */
++    uint32_t OC;         /* dst ne[1] == w ne[2] */
++    uint32_t K;          /* w ne[0] */
++    uint32_t pad;
++    uint32_t dil;
++    float slope;         /* output leaky slope, 0 = none */
++    float in_scale;      /* input fold: v = leaky(x * in_scale) */
++    float in_slope;      /* input fold slope, 0 = none */
++    uint32_t has_bias;
++    uint32_t has_res;
++};
++static_assert(sizeof(vk_op_conv_direct_1d_push_constants) <= 128, "sizeof(vk_op_conv_direct_1d_push_constants) must be <= 128");
++
+ struct vk_op_snake_push_constants {
+     uint32_t ne0;
+     uint32_t ne1;
+@@ -5844,6 +5877,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         ggml_vk_create_pipeline(device, device->pipeline_scatter_elements_add, "scatter_elements_add", scatter_elements_add_len, scatter_elements_add_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
+     }
+ 
++    // learned-ops patch: direct stride-1 1D conv tile variants.  One SPIR-V;
++    // the warptile is passed as Vulkan spec constants (mul_mm scheme), so
++    // the driver specializes/unrolls/register-allocates each variant.
++    // spec_consts = {BLOCK_SIZE, BM, BN, BK, WM, WN, TM, TN, WMITER};
++    // wg_denoms = {BN (t-tile), BM (oc-tile), 1}.  All loads/stores are
++    // bounds-checked in-shader, so robust buffer access is disabled.
++    ggml_vk_create_pipeline(device, device->pipeline_conv_direct_1d_f32_e64, "conv_direct_1d_f32_e64", conv_direct_1d_f32_len, conv_direct_1d_f32_data, "main", 5, sizeof(vk_op_conv_direct_1d_push_constants), {64, 64, 1}, {128, 64, 64, 32, 32, 32, 4, 2, 2}, 1, true);
++    ggml_vk_create_pipeline(device, device->pipeline_conv_direct_1d_f32_e32, "conv_direct_1d_f32_e32", conv_direct_1d_f32_len, conv_direct_1d_f32_data, "main", 5, sizeof(vk_op_conv_direct_1d_push_constants), {64, 32, 1}, {128, 32, 64, 32, 16, 32, 4, 2, 1}, 1, true);
++    ggml_vk_create_pipeline(device, device->pipeline_conv_direct_1d_f32_e16, "conv_direct_1d_f32_e16", conv_direct_1d_f32_len, conv_direct_1d_f32_data, "main", 5, sizeof(vk_op_conv_direct_1d_push_constants), {64, 16, 1}, {128, 16, 64, 32, 16, 16, 4, 2, 1}, 1, true);
++    ggml_vk_create_pipeline(device, device->pipeline_conv_direct_1d_f32_w64, "conv_direct_1d_f32_w64", conv_direct_1d_f32_len, conv_direct_1d_f32_data, "main", 5, sizeof(vk_op_conv_direct_1d_push_constants), {64, 64, 1}, {256, 64, 64, 32, 16, 32, 4, 2, 1}, 1, true);
++    ggml_vk_create_pipeline(device, device->pipeline_conv_direct_1d_f32_w128, "conv_direct_1d_f32_w128", conv_direct_1d_f32_len, conv_direct_1d_f32_data, "main", 5, sizeof(vk_op_conv_direct_1d_push_constants), {128, 64, 1}, {256, 64, 128, 32, 16, 64, 4, 2, 1}, 1, true);
++
+     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f32,  "col2im_1d_f32",  col2im_1d_f32_len,  col2im_1d_f32_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
+     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_f16,  "col2im_1d_f16",  col2im_1d_f16_len,  col2im_1d_f16_data,  "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
+     ggml_vk_create_pipeline(device, device->pipeline_col2im_1d_bf16, "col2im_1d_bf16", col2im_1d_bf16_len, col2im_1d_bf16_data, "main", 2, sizeof(vk_op_col2im_1d_push_constants), {256, 1, 1}, {}, 1, true);
+@@ -11643,6 +11688,26 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             return ctx->device->pipeline_rel_pos_bias_f32;
+         }
+         return nullptr;
++    case GGML_OP_CONV_DIRECT_1D:
++        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            // tile-variant pick by OC (pure perf heuristic; every variant is
++            // correct for any IC/OC): the oc-tile BM tracks OC so the x side
++            // is read the fewest times, the t-tile BN keeps occupancy up.
++            // w128 (two t-tiles per workgroup) amortizes the per-chunk
++            // barrier/staging machinery over twice the output — the chunked
++            // phase structure is the dominant fixed cost, so it wins for the
++            // big levels.  (Variant set tuned as a whole on RTX 2070-class
++            // hardware; pick by OC only, no vendor-specific assumptions.)
++            const int64_t OC = dst->ne[1];
++            if (OC <= 16) {
++                return ctx->device->pipeline_conv_direct_1d_f32_e16;
++            }
++            if (OC <= 32) {
++                return ctx->device->pipeline_conv_direct_1d_f32_e32;
++            }
++            return ctx->device->pipeline_conv_direct_1d_f32_w128;
++        }
++        return nullptr;
+     case GGML_OP_SCATTER_ELEMENTS:
+         {
+             const int32_t reduction = ((const int32_t *)dst->op_params)[0];
+@@ -12362,6 +12427,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+             elements = { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 1 };
+         }
+         break;
++    case GGML_OP_CONV_DIRECT_1D:
++        {
++            // dispatch over output tiles: x = OL (t-dim), y = OC
++            // (wg_denoms {64, BN, 1} split the tile across workgroups)
++            const uint32_t OL = (uint32_t)dst->ne[0];
++            const uint32_t OC = (uint32_t)dst->ne[1];
++            elements = { OL, OC, 1 };
++        } break;
+     default:
+         elements = { (uint32_t)ggml_nelements(src0), 1, 1 };
+         break;
+@@ -12388,6 +12461,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         vk_subbuffer subbuf2 = use_src2 ? src2_buf : src0_buf;
+         vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
+         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, subbuf2, dst_buf, subbuf3 }, pc, elements);
++    } else if (op == GGML_OP_CONV_DIRECT_1D) {
++        // bias (src2) and res (src3) are optional, but the shader descriptor
++        // set expects 5 bindings; bind src0's buffer as a dummy for missing
++        // ones (has_bias/has_res guard the loads)
++        vk_subbuffer subbuf2 = use_src2 ? src2_buf : src0_buf;
++        vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, subbuf2, subbuf3, dst_buf }, pc, elements);
+     } else if (op == GGML_OP_IM2COL || op == GGML_OP_IM2COL_3D || op == GGML_OP_IM2COL_FAST_1D) {
+         if (ctx->device->shader_int64 && ctx->device->buffer_device_address) {
+             // buffer device address path doesn't use dst buffer
+@@ -14220,6 +14300,37 @@ static void ggml_vk_snake(ggml_backend_vk_context * ctx, vk_context& subctx, ggm
+     ggml_vk_op_f32<vk_op_snake_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SNAKE, std::move(pc));
+ }
+ 
++static void ggml_vk_conv_direct_1d(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
++    GGML_ASSERT(src0->type == GGML_TYPE_F32);  // w [K, IC, OC]
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);  // x [T, IC]
++    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++
++    // op_params (7 x int32): [0] pad, [1] dil, [2] leaky_slope (f32), [3] has_bias,
++    //                         [4] in_scale (f32), [5] in_slope (f32), [6] has_res
++    const int32_t * op_params = (const int32_t *)dst->op_params;
++    float slope, in_scale, in_slope;
++    memcpy(&slope,    &op_params[2], sizeof(float));
++    memcpy(&in_scale, &op_params[4], sizeof(float));
++    memcpy(&in_slope, &op_params[5], sizeof(float));
++
++    vk_op_conv_direct_1d_push_constants pc{
++        static_cast<uint32_t>(dst->ne[0]),    // OL
++        static_cast<uint32_t>(src1->ne[0]),   // T
++        static_cast<uint32_t>(src1->ne[1]),   // IC
++        static_cast<uint32_t>(dst->ne[1]),    // OC
++        static_cast<uint32_t>(src0->ne[0]),   // K
++        static_cast<uint32_t>(op_params[0]),  // pad
++        static_cast<uint32_t>(op_params[1]),  // dil
++        slope,
++        in_scale,
++        in_slope,
++        static_cast<uint32_t>(op_params[3]),  // has_bias
++        static_cast<uint32_t>(op_params[6]),  // has_res
++    };
++
++    ggml_vk_op_f32<vk_op_conv_direct_1d_push_constants>(ctx, subctx, src0, src1, src2, src3, dst, GGML_OP_CONV_DIRECT_1D, std::move(pc));
++}
++
+ static void ggml_vk_scatter_elements(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+     const ggml_tensor * data    = dst->src[0];
+     const ggml_tensor * updates = dst->src[1];
+@@ -15724,6 +15835,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+     case GGML_OP_RMS_NORM_BACK:
+         ggml_vk_rms_norm_back(ctx, compute_ctx, src0, src1, node);
+ 
++        break;
++    case GGML_OP_CONV_DIRECT_1D:
++        ggml_vk_conv_direct_1d(ctx, compute_ctx, src0, src1, src2, src3, node);
++
+         break;
+     case GGML_OP_L2_NORM:
+         ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
+@@ -18774,6 +18889,46 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32
+                 && op->type == GGML_TYPE_F32
+                 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
++        case GGML_OP_CONV_DIRECT_1D:
++            {
++                // src0 = w [K, IC, OC], src1 = x [T, IC], src2 = bias [OC] (opt),
++                // src3 = res [OL, OC] (opt), dst = [OL, OC]; all F32, contiguous.
++                // Any IC/OC sizes work: the shader loops ic in BK blocks and
++                // guards the oc tile bounds; the variant pick in
++                // ggml_vk_op_get_pipeline is a pure performance heuristic.
++                const ggml_tensor * w = op->src[0];
++                const ggml_tensor * x = op->src[1];
++                const ggml_tensor * bias = op->src[2];
++                const ggml_tensor * res  = op->src[3];
++                if (!(w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)) {
++                    return false;
++                }
++                if (!(ggml_is_contiguous(w) && ggml_is_contiguous(x) && ggml_is_contiguous(op))) {
++                    return false;
++                }
++                if (bias != nullptr && !(bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias))) {
++                    return false;
++                }
++                if (res != nullptr && !(res->type == GGML_TYPE_F32 && ggml_is_contiguous(res))) {
++                    return false;
++                }
++                // shape contract: IC must agree between w and x, and the x
++                // row halo (K-1)*dil must fit the staged-row cap in the
++                // shader (XS_HALO).  K >= 3 is required so that a BK chunk
++                // spans at most XS_ROWS-1 input rows in the circular x
++                // window (K in {1,2} would need more window slots than the
++                // shared-memory budget allows); anything rejected here
++                // falls back to im2col.
++                if (w->ne[1] != x->ne[1]) {
++                    return false;
++                }
++                {
++                    const int32_t * cdp = (const int32_t *) op->op_params;
++                    const int64_t K    = w->ne[0];
++                    const int64_t halo = (K - 1) * (int64_t) cdp[1];
++                    return K >= 3 && halo <= 72;
++                }
++            }
+         case GGML_OP_SCATTER_ELEMENTS:
+             // src0 = data (F32), src1 = updates (F32), src2 = indices (I32)
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32
+diff --git a/src/ggml-vulkan/vulkan-shaders/conv_direct_1d.comp b/src/ggml-vulkan/vulkan-shaders/conv_direct_1d.comp
+new file mode 100644
+index 0000000..dbff335
+--- /dev/null
++++ b/src/ggml-vulkan/vulkan-shaders/conv_direct_1d.comp
+@@ -0,0 +1,418 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++
++// learned-ops patch: direct stride-1 1-D convolution (HiFiGAN vocoder).
++//
++//   out[t, oc] = act( bias[oc]
++//                     + sum_{ic,kw} w[kw, ic, oc] * x'[ic, t + kw*dil - pad]
++//                     + res[t, oc] )
++//   x' = zero-padded x, optionally pre-folded: v = leaky(x * in_scale)
++//   act = leaky ReLU(slope) when slope != 0
++//
++// F32-only implicit GEMM (mul_mm SIMT class).  The GEMM K dimension is the
++// flattened tap space k = ic*K + kw (kw fastest), walked in BK chunks —
++// the same ic-major / kw-minor order as the CPU kernel.  Roles:
++//   A = w: a [OC, IC*K] row-major view of the stock [K, IC, OC] weight
++//       (flat index (oc*IC + ic)*K + kw == oc*(IC*K) + ic*K + kw), so the
++//       A tile rows are fully contiguous along k — coalesced loads.
++//   B = x: b[t][k] = x[k/K][t + (k%K)*dil - pad] (zero-padded).
++// No fp16 anywhere: operands, staging and accumulation are all fp32 (the
++// vocoder contract).
++//
++// Memory strategy (the whole point of this version): gathering x straight
++// from global per k value re-reads every x element K times per oc-tile.
++// Instead the x rows touched by the k chunks are staged into a small
++// circular shared-memory window (XS_ROWS slots, row = tile + tap halo):
++// each input row is loaded exactly once per workgroup, so x traffic drops
++// K-fold and the weight matrix stays L2-resident.  The k chunks tile the
++// full flattened range exactly (no padding waste) and walk k ascending, so
++// the accumulation order — and therefore the numerics — match the naive
++// k-linear version bit for bit.
++//
++//   * A (weights) staged per chunk, prefetched into registers during the
++//     previous chunk's compute (pre_a).
++//   * x window rows prefetched the same way (pre_x): chunk c+1's new rows
++//     are LDG'd into registers while chunk c computes, then stored at the
++//     next chunk boundary — no exposed global-load latency at the barrier.
++//   * k -> (x window slot, tap offset) decode in a double-buffered koff
++//     table (uvec2 pairs, built one chunk ahead).
++//   * x window rows loaded at chunk boundaries: chunk c needs input rows
++//     [floor(cb/K), floor((cb+bk-1)/K)]; rows enter the window in order,
++//     slot(ic) = ic mod XS_ROWS.  With span <= XS_ROWS-1 a newly written
++//     row can never clobber a row still needed by the current chunk.
++//   * inner product as an explicit fma() chain, k ascending — 2 issued
++//     ops per 2 MACs.
++//   * 2 barriers per BK chunk.
++//
++// Tile parameters are VULKAN SPEC CONSTANTS (exactly like mul_mm), passed
++// at pipeline creation via ggml_vk_create_pipeline's spec_consts argument:
++// the SPIR-V stays small and generic and the driver specializes/unrolls/
++// register-allocates — compile-time #define tiles make glslc fully unroll
++// into a bloated module that defeats the driver's register allocator.
++//
++//   constant_id 0: BLOCK_SIZE (workgroup size, local_size_x_id)
++//   constant_id 1: BM   (oc-tile)
++//   constant_id 2: BN   (t-tile)
++//   constant_id 3: BK   (k-chunk depth)
++//   constant_id 4: WM   (warp rows, oc dim)
++//   constant_id 5: WN   (warp cols, t dim)
++//   constant_id 6: TM   (thread rows)
++//   constant_id 7: TN   (thread cols)
++//   constant_id 8: WMITER
++//
++// Bindings: 0 = w [K, IC, OC] (contiguous, viewed as [OC, IC*K])
++//           1 = x [T, IC]     (x[ic*T + t])
++//           2 = bias [OC]     (dummy buffer when !has_bias)
++//           3 = res [OL, OC]  (res[oc*OL + t], dummy when !has_res)
++//           4 = dst [OL, OC]  (dst[oc*OL + t])
++//
++// Dispatch: elements = {OL, OC, 1}, workgroup denoms = {BN, BM, 1}
++// (x tiles t, y tiles oc).  All buffer indices fit int32.
++//
++// Tiling constraints (must hold for every variant):
++//   BLOCK_SIZE == (BM/WM) * (BN/WN) * 32
++//   WNITER == (WM*WN) / (32*TM*TN*WMITER) is a positive integer
++//   (WSUBM/TM) * (WSUBN/TN) == 32
++//   BM*BK divisible by 2*BLOCK_SIZE   (A prefetch registers)
++// A node needs K >= 3 (so a BK chunk spans at most XS_ROWS-1 input rows —
++// this also bounds the per-chunk new-row count at 11, sizing pre_x) and
++// (K-1)*dil <= XS_HALO; anything else is rejected in supports_op and
++// falls back to im2col.
++
++#define WARP 32
++#define XS_ROWS 12    // x window slots (circular); chunk span(K=3) = 11
++#define XS_HALO 72    // max supported (K-1)*dil halo per staged x row
++
++layout (local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++layout (constant_id = 1) const uint BM = 128;
++layout (constant_id = 2) const uint BN = 64;
++layout (constant_id = 3) const uint BK = 32;
++layout (constant_id = 4) const uint WM = 64;
++layout (constant_id = 5) const uint WN = 32;
++layout (constant_id = 6) const uint TM = 4;
++layout (constant_id = 7) const uint TN = 4;
++layout (constant_id = 8) const uint WMITER = 2;
++
++const uint BLOCK_SIZE = (BM / WM) * (BN / WN) * WARP;
++
++#define BK_STEP 4
++
++#define WNITER ((WM * WN) / (WARP * TM * TN * WMITER))
++#define WSUBM (WM / WMITER)
++#define WSUBN (WN / WNITER)
++#define SHMEM_STRIDE (BK / 2 + 1)
++
++const uint XS_ROW = BN + XS_HALO;          // staged x row stride
++const uint A_ITERS = BM * BK / (2 * BLOCK_SIZE);   // A vec2 loads per thread
++// max new x rows per chunk transition: floor((BK-1)/3) + 1 = 11 (K >= 3)
++const uint XE_MAX = (11u * XS_ROW + BLOCK_SIZE - 1u) / BLOCK_SIZE;
++
++layout (binding = 0) readonly buffer W_BUF { float w[]; };
++layout (binding = 1) readonly buffer X_BUF { float x[]; };
++layout (binding = 2) readonly buffer B_BUF { float bias[]; };
++layout (binding = 3) readonly buffer R_BUF { float res[]; };
++layout (binding = 4) writeonly buffer D_BUF { float dst[]; };
++
++layout (push_constant) uniform parameter
++{
++    uint OL;          // dst ne[0]
++    uint T;           // x ne[0]
++    uint IC;          // x ne[1] == w ne[1]
++    uint OC;          // dst ne[1] == w ne[2]
++    uint K;           // w ne[0]
++    uint pad;
++    uint dil;
++    float slope;      // output leaky slope, 0 = no activation
++    float in_scale;   // input fold: v = leaky(x * in_scale)
++    float in_slope;   // input fold slope, 0 = no fold
++    uint has_bias;
++    uint has_res;
++} p;
++
++// A staging: [BM oc][BK/2 k-pairs]   (vec2 = k, k+1)
++shared vec2 buf_a[BM * SHMEM_STRIDE];
++// x window: xs[ic mod XS_ROWS][j] = x'[ic][t0 - pad + j], j in [0, BN+(K-1)*dil)
++shared float xs[XS_ROWS * XS_ROW];
++// k -> xs offset decode, packed as consecutive-k pairs (uvec2 = k, k+1),
++// double-buffered on chunk parity (built one chunk ahead)
++shared uvec2 koff[2][BK / 2];
++
++// per-thread prefetch staging (next chunk), in registers
++vec2 pre_a[A_ITERS];
++float pre_x[XE_MAX];
++
++int gT;
++int gKC;
++int gICKC;
++int gdil;
++int gpad;
++uint gROWL;    // staged row length: BN + (K-1)*dil
++
++float leaky(float v, float s) {
++    return (v > 0.0f ? v : 0.0f) + s * (v < 0.0f ? v : 0.0f);
++}
++
++float fold_input(float v) {
++    if (p.in_scale != 1.0f) v *= p.in_scale;
++    if (p.in_slope != 0.0f) v = leaky(v, p.in_slope);
++    return v;
++}
++
++// Issue the A (weight) loads for k chunk [kb, kb+bk) into the prefetch
++// registers.  Pure global addressing, no shared memory dependency — the
++// loads overlap with the current chunk's compute.
++void a_prefetch(uint kb, uint bk) {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint oc0 = gl_WorkGroupID.y * BM;
++
++    const uint a_pr  = tid % (BK / 2);
++    const uint a_row = tid / (BK / 2);
++    const uint a_rstride = BLOCK_SIZE / (BK / 2);
++    uint it = 0;
++    for (uint l = a_row; l < BM; l += a_rstride) {
++        vec2 v = vec2(0.0f, 0.0f);
++        const uint oc = oc0 + l;
++        if (oc < p.OC) {
++            const uint j = 2 * a_pr;
++            if (j + 1 < bk) {
++                const uint base = oc * uint(gICKC) + kb + j;
++                v.x = w[base];
++                v.y = w[base + 1];
++            } else if (j < bk) {
++                v.x = w[oc * uint(gICKC) + kb + j];
++            }
++        }
++        pre_a[it] = v;
++        it++;
++    }
++}
++
++// Move the prefetched A registers into shared memory.
++void a_store() {
++    const uint tid = gl_LocalInvocationID.x;
++    const uint a_pr  = tid % (BK / 2);
++    const uint a_row = tid / (BK / 2);
++    const uint a_rstride = BLOCK_SIZE / (BK / 2);
++    uint it = 0;
++    for (uint l = a_row; l < BM; l += a_rstride) {
++        buf_a[l * SHMEM_STRIDE + a_pr] = pre_a[it];
++        it++;
++    }
++}
++
++// koff entry for global k (slot of its input row + tap offset)
++uint koff_of(uint k) {
++    const uint ic = k / uint(gKC);
++    const uint kw = k - ic * uint(gKC);
++    return (ic % XS_ROWS) * XS_ROW + kw * uint(gdil);
++}
++
++// Walk description shared by xs_prefetch / xs_store: enumerate the
++// elements of rows [lo, hi] as e = tid + s*BLOCK_SIZE, decomposed
++// incrementally into (row r, column j).  Both walks must see identical
++// (lo, hi) so the register index matches.
++//
++// Issue the x row loads for [lo, hi] into the pre_x registers (LDGs that
++// overlap with the current chunk's compute).
++void xs_prefetch(uint lo, uint hi) {
++    if (hi < lo) return;
++    const uint tid = gl_LocalInvocationID.x;
++    const uint t0  = gl_WorkGroupID.x * BN;
++
++    const uint total = (hi - lo + 1u) * gROWL;
++    uint e = tid;
++    uint r = e / gROWL;
++    uint j = e - r * gROWL;
++    uint it = 0;
++    while (e < total) {
++        const int xi = int(t0) - gpad + int(j);
++        float v = 0.0f;
++        if (xi >= 0 && xi < gT) {
++            v = fold_input(x[int(lo + r) * gT + xi]);
++        }
++        pre_x[it] = v;
++        it++;
++        e += BLOCK_SIZE;
++        j += BLOCK_SIZE;
++        while (j >= gROWL) {
++            j -= gROWL;
++            r += 1u;
++        }
++    }
++}
++
++// Move the prefetched x rows into the shared-memory window.
++void xs_store(uint lo, uint hi) {
++    if (hi < lo) return;
++    const uint tid = gl_LocalInvocationID.x;
++
++    const uint total = (hi - lo + 1u) * gROWL;
++    uint e = tid;
++    uint r = e / gROWL;
++    uint j = e - r * gROWL;
++    uint slot = (lo + r) % XS_ROWS;
++    uint it = 0;
++    while (e < total) {
++        xs[slot * XS_ROW + j] = pre_x[it];
++        it++;
++        e += BLOCK_SIZE;
++        j += BLOCK_SIZE;
++        while (j >= gROWL) {
++            j -= gROWL;
++            r += 1u;
++            slot += 1u;
++            if (slot >= XS_ROWS) slot -= XS_ROWS;
++        }
++    }
++}
++
++void main() {
++    const uint t0  = gl_WorkGroupID.x * BN;   // t-tile base
++    const uint oc0 = gl_WorkGroupID.y * BM;   // oc-tile base
++
++    const uint tid = gl_LocalInvocationID.x;
++
++    const uint warp_i = tid / WARP;
++    const uint tiw = tid % WARP;
++
++    const uint tiwr = tiw % (WSUBM / TM);
++    const uint tiwc = tiw / (WSUBM / TM);
++
++    const uint warp_r = warp_i % (BM / WM);
++    const uint warp_c = warp_i / (BM / WM);
++
++    gT    = int(p.T);
++    gKC   = int(p.K);
++    gICKC = int(p.IC) * gKC;    // flattened tap count
++    gdil  = int(p.dil);
++    gpad  = int(p.pad);
++    gROWL = BN + (p.K - 1u) * p.dil;
++
++    vec2 sums[WMITER * TM * WNITER * TN / 2];
++    for (uint i = 0; i < WMITER * TM * WNITER * TN / 2; i++) {
++        sums[i] = vec2(0.0f, 0.0f);
++    }
++    vec4 cache_a[WMITER * TM];
++    vec4 cache_b;
++
++    const uint nch = (uint(gICKC) + BK - 1) / BK;
++
++    // chunk 0 prefetches (A + x rows + koff decode) before the first barrier
++    {
++        const uint bk0 = min(BK, uint(gICKC));
++        a_prefetch(0u, bk0);
++        xs_prefetch(0u, (bk0 - 1u) / uint(gKC));
++        if (tid < BK / 2) {
++            koff[0][tid] = uvec2(koff_of(2u * tid), koff_of(2u * tid + 1u));
++        }
++    }
++
++    uint slot = 0;
++    for (uint c = 0; c < nch; c++) {
++        const uint cb = c * BK;                          // chunk base k
++        const uint bk = min(BK, uint(gICKC) - cb);
++
++        // input rows [lo, hi] needed by this chunk; rows above lo are new
++        const uint lo = (c == 0u) ? 0u : ((cb - 1u) / uint(gKC) + 1u);
++        const uint hi = (cb + bk - 1u) / uint(gKC);
++
++        a_store();
++        xs_store(lo, hi);
++
++        if (c + 1 < nch) {
++            const uint ncb = cb + BK;                    // next chunk base
++            const uint nbk = min(BK, uint(gICKC) - ncb);
++            const uint nlo = (cb + BK - 1u) / uint(gKC) + 1u;
++            const uint nhi = (ncb + nbk - 1u) / uint(gKC);
++            if (tid < BK / 2) {
++                koff[slot ^ 1][tid] = uvec2(koff_of(ncb + 2u * tid),
++                                            koff_of(ncb + 2u * tid + 1u));
++            }
++            barrier();
++            // prefetch the chunk after this one (A + x rows)
++            a_prefetch(ncb, nbk);
++            xs_prefetch(nlo, nhi);
++        } else {
++            barrier();
++        }
++
++        // ---- compute: register-blocked fma chain, k ascending ----
++        [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
++            const uvec2 kv0 = koff[slot][2 * i];         // k 4i+0, 4i+1
++            const uvec2 kv1 = koff[slot][2 * i + 1];     // k 4i+2, 4i+3
++
++            [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
++                [[unroll]] for (uint j = 0; j < TM; j++) {
++                    cache_a[wsir * TM + j].xy = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i];
++                    cache_a[wsir * TM + j].zw = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + 2 * i + 1];
++                }
++            }
++
++            [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
++                [[unroll]] for (uint cc = 0; cc < TN; cc++) {
++                    const uint col = warp_c * WN + wsic * WSUBN + tiwc * TN + cc;
++                    cache_b = vec4(xs[kv0.x + col], xs[kv0.y + col],
++                                   xs[kv1.x + col], xs[kv1.y + col]);
++
++                    [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
++                        [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
++                            const uint si = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
++                            const vec4 a0 = cache_a[wsir * TM + 2 * cr];
++                            const vec4 a1 = cache_a[wsir * TM + 2 * cr + 1];
++                            vec2 s = sums[si];
++                            s.x = fma(a0.x, cache_b.x, s.x);
++                            s.x = fma(a0.y, cache_b.y, s.x);
++                            s.x = fma(a0.z, cache_b.z, s.x);
++                            s.x = fma(a0.w, cache_b.w, s.x);
++                            s.y = fma(a1.x, cache_b.x, s.y);
++                            s.y = fma(a1.y, cache_b.y, s.y);
++                            s.y = fma(a1.z, cache_b.z, s.y);
++                            s.y = fma(a1.w, cache_b.w, s.y);
++                            sums[si] = s;
++                        }
++                    }
++                }
++            }
++        }
++
++        barrier();
++        slot ^= 1;
++    }
++
++    // ---- epilogue + store: bias, residual, output leaky ----
++    // rows = oc (bounds OC), cols = t (bounds OL); dst[oc*OL + t]
++    // sums[...].x / .y hold consecutive M-ROWS (oc = dro+2cr / dro+2cr+1)
++    // at the same N-column t = dct + cc
++    [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
++        [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
++            const uint dro = oc0 + warp_r * WM + wsir * WSUBM + tiwr * TM;
++            const uint dct = t0 + warp_c * WN + wsic * WSUBN + tiwc * TN;
++            [[unroll]] for (uint cc = 0; cc < TN; cc++) {
++                [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
++                    const uint si = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
++                    if (dct + cc < p.OL) {
++                        const uint tcol = dct + cc;
++                        const uint ocx = dro + 2 * cr;
++                        if (ocx < p.OC) {
++                            float v = (p.has_bias != 0) ? bias[ocx] : 0.0f;
++                            v += sums[si].x;
++                            if (p.has_res != 0) v += res[int(ocx) * int(p.OL) + int(tcol)];
++                            if (p.slope != 0.0f) v = leaky(v, p.slope);
++                            dst[int(ocx) * int(p.OL) + int(tcol)] = v;
++                        }
++                        const uint ocy = dro + 2 * cr + 1;
++                        if (ocy < p.OC) {
++                            float v = (p.has_bias != 0) ? bias[ocy] : 0.0f;
++                            v += sums[si].y;
++                            if (p.has_res != 0) v += res[int(ocy) * int(p.OL) + int(tcol)];
++                            if (p.slope != 0.0f) v = leaky(v, p.slope);
++                            dst[int(ocy) * int(p.OL) + int(tcol)] = v;
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index ac78e08..411cdc9 100644
+--- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1060,6 +1060,12 @@ void process_shaders() {
+     string_to_spv("channel_shuffle_f32", "channel_shuffle.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+     string_to_spv("affine_prelu_f32",    "affine_prelu.comp",    {{"A_TYPE", "float"}});
+ 
++    // direct 1-D convolution (F32 implicit GEMM).  A = w viewed as
++    // [OC, IC*K] (contiguous k), B = x [t, k] — coalesced on both sides.
++    // Tile parameters are Vulkan spec constants (mul_mm style): one SPIR-V,
++    // the warptile is chosen per pipeline at creation time.
++    string_to_spv("conv_direct_1d_f32", "conv_direct_1d.comp", {});
++
+     string_to_spv("col2im_1d_f32",  "col2im_1d.comp", {{"DATA_A_F32", "1"},  {"A_TYPE", "float"},     {"D_TYPE", "float"}});
+     string_to_spv("col2im_1d_f16",  "col2im_1d.comp", {{"DATA_A_F16", "1"},  {"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+     string_to_spv("col2im_1d_bf16", "col2im_1d.comp", {{"DATA_A_BF16", "1"}, {"A_TYPE", "uint16_t"},  {"D_TYPE", "uint16_t"}});

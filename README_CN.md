@@ -13,7 +13,7 @@
 | `GGML_OP_REL_POS_BIAS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR)（ggml 的 R 绑定） | BoTNet 风格双轴相对位置注意力偏置：按轴查位移表 + 逐通道点积，含 CPU 与 Vulkan 实现。 |
 | `GGML_OP_SCATTER_ELEMENTS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR) | ONNX `ScatterElements` 语义——`get_rows` 的逆操作。Vulkan 端用 `VK_EXT_shader_atomic_float` 原子加实现累加归约。 |
 | `GGML_OP_ADD_LEAKY_RELU` | 为 [pc-nsf-hifigan.cpp](https://github.com/KakaruHayate/pc-nsf-hifigan.cpp)（NSF-HiFiGAN 声码器）新写 | `y = leaky(a + b)` 单次遍历——广播 `[1,C]` 或逐行 `[T,C]` bias；与 `add` + `leaky_relu` 组合逐位一致。同时把原生 CPU `leaky_relu` 内核并行化（上游强制 `n_tasks = 1`）。 |
-| `GGML_OP_CONV_DIRECT_1D`（含 `_fused`） | 为 pc-nsf-hifigan.cpp 新写 | stride-1 直接 1D 卷积、无 im2col scratch：权重每次调用打包成 `[IC·K, OCp]`，AVX2 6×16 微内核 + 指针递增寻址（单线程比 `imul` 索引快 26%）。`_fused` 把 bias / 残差 / 输出 leaky 与输入侧 `leaky·scale` **逐位一致**地折入——全声码器 2.1×（10.0 s → 4.8 s，24 线程，16C/32T）。 |
+| `GGML_OP_CONV_DIRECT_1D`（含 `_fused`） | 为 pc-nsf-hifigan.cpp 新写 | stride-1 直接 1D 卷积、无 im2col scratch：权重每次调用打包成 `[IC·K, OCp]`，AVX2 6×16 微内核 + 指针递增寻址（单线程比 `imul` 索引快 26%）。`_fused` 把 bias / 残差 / 输出 leaky 与输入侧 `leaky·scale` **逐位一致**地折入——全声码器 2.85×（80.0 s → 28.0 s，24 线程，16C/32T）。 |
 
 ## 补丁二：十个 qvac 融合算子
 
@@ -38,6 +38,16 @@
 
 `GRU` / `ZERO_UPSAMPLE` / `CHANNEL_SHUFFLE` / `AFFINE_PRELU` / `SNAKE` 五个另有 Vulkan compute shader 实现，`GRU` 额外带 H = 2/4/8 的寄存器驻留变体，共享内存上限 H ≤ 128。
 
+## 补丁四：`CONV_DIRECT_1D` 的 Vulkan compute 后端
+
+**叠加在补丁一、二之上**（补丁二占用了相同的 shader 注册表与分发插入点，因此必须按 1 → 2 → 4 顺序应用；补丁三仅 Metal、与其正交——装不装它，补丁四同样应用）。这是补丁一声码器工作的 GPU 半边：不改变任何算子语义——`tests/test_learned_ops.c` 仍是冻结契约。
+
+- `vulkan-shaders/conv_direct_1d.comp` —— 隐式 GEMM 的 stride-1 直接 1D 卷积，仅 fp32。单一 SPIR-V；warp 分块以 Vulkan specialization constants 传入（`mul_mm` 方案），生成五条具体 pipeline。`ggml_vk_op_get_pipeline` 按输出通道数逐节点选择分块（OC ≤ 16 → e16，≤ 32 → e32，否则 w128）；**任意变体对任意 shape 数值一致**，选择纯属性能启发式，不含任何厂商特定假设。
+- bias、残差、输出侧 leaky、输入侧 `leaky·scale` 融合与 CPU `_fused` 算子契约完全一致（同一 op_params 布局）。
+- `supports_op` 门控：fp32 + 连续内存，`K ≥ 3` 且 `(K−1)·dilation ≤ 72`（共享内存 halo 上限）；不满足返回 false，调度器自动回落 CPU 内核。**以 raw graph 模式直接驱动 ggml-vulkan 的消费方**（直接调 `ggml_vk_build_graph`、绕过调度器的 `supports_op` 检查）必须自行执行同一门控——NSF-HiFiGAN 中 K = 2 的亚像素上采样卷积超出该 shader 的暂存行窗口，不加门控会静默产生错误输出。pc-nsf-hifigan.cpp 用 `PCNSF_DIRECT_MIN_K` 实现（Vulkan 默认 3，其余后端 1）。
+
+全 NSF-HiFiGAN 声码器实测（RTX 2070，32.0.12.x 级驱动，全程 fp32，`GGML_VK_DISABLE_COOPMAT2=1` 关闭张量核；pc-nsf-hifigan.cpp `hifigan_cli` 参考音频多次运行取中位）：**端到端约 433–479 ms**，对比同机 ONNX Runtime DML EP 326 ms / CPU EP 5 155 ms。对 torch-CPU 参考的精度：corr 0.99999985、max|Δ| 6.1e-4——比同片 ORT-DML 紧一个数量级（corr 0.99999697、max|Δ| 2.1e-3）。完整数据与复现命令见 [docs/benchmarks_zh.md](docs/benchmarks_zh.md#补丁四vulkan-conv_direct_1d)。
+
 基线：ggml [`30bf868`](https://github.com/ggml-org/ggml)（v0.19.0）。diff 只在枚举/builder/kernel 的插入点上做增量，应用到邻近 commit 通常只需少量冲突处理。
 
 ## 目录结构
@@ -47,7 +57,8 @@ ggml-audio-patch/
 ├── patches/
 │   ├── learned-ops-ggml0190.patch   # 基于 ggml v0.19.0 的统一 diff（补丁一）
 │   ├── qvac-ops-ggml0190.patch      # 叠加在补丁一之上的统一 diff（补丁二）
-│   └── metal-ops-ggml0190.patch     # 叠加在补丁二之上的 Metal 集成（补丁三）
+│   ├── metal-ops-ggml0190.patch     # 叠加在补丁二之上的 Metal 集成（补丁三）
+│   └── vulkan-conv-direct-1d-ggml0190.patch  # CONV_DIRECT_1D 的 Vulkan 后端（补丁四，叠加于一+二）
 ├── tests/
 │   ├── test_learned_ops.c           # 补丁一正确性冒烟测试（手写参考值对照）
 │   ├── test_qvac_ops.c              # 补丁二正确性测试（cpu | vk | metal 挂具钩子）
@@ -71,16 +82,17 @@ ggml-audio-patch/
 ```bash
 git clone https://github.com/ggml-org/ggml.git ggml-src
 cd ggml-src && git checkout 30bf868        # v0.19.0
-git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch   # 补丁一
-git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch      # 补丁二（顺序应用）
-git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch     # 补丁三（Metal，可选）
+git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch            # 补丁一
+git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch               # 补丁二（顺序应用）
+git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch              # 补丁三（Metal，可选）
+git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # 补丁四（叠加于一+二）
 ```
 
-三个补丁必须按顺序应用。非 Metal 平台可不应用补丁三；补丁二必须跟在补丁一之后。
+补丁二必须跟在补丁一之后：两者触碰相同的枚举断言与分发代码块。非 Metal 平台可不应用补丁三。补丁四必须跟在补丁一、二之后：它消费补丁一的 `CONV_DIRECT_1D`，并与补丁二共用 shader 注册表/分发插入点（与补丁三正交——无论装不装 Metal 补丁都可同样应用）。只装补丁一可以（跳过后续）；只装一+四**不支持**。
 
 配置 / 编译 / 测试见 **[docs/building_zh.md](docs/building_zh.md)**（含 Vulkan SDK、CUDA 工具链、Windows 生成器选择等注意事项），或直接跑 `scripts/build-and-test.sh` / `build-and-test.ps1`。
 
-性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×；`CONV_DIRECT_1D`+融合在全 NSF-HiFiGAN 声码器上 2.1×（10 038 → 4 764 ms，16C/32T Xeon E5-2675 v3、24 线程），与 im2col 路径逐位同级。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.80×；Snake 在 Metal 达 3.05×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.24×；affine_prelu Vulkan 最高 6.3×；gru 补上 RNN 空缺，CPU H512×B4×L32 约 47 ms。）
+性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×；`CONV_DIRECT_1D`+融合在全 NSF-HiFiGAN 声码器上 2.85×（80 002 → 28 030 ms，16C/32T Xeon E5-2675 v3、24 线程；仍比 ONNX Runtime CPU EP 慢约 5.4×，差距如实写入文档）。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.80×；Snake 在 Metal 达 3.05×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.24×；affine_prelu Vulkan 最高 6.3×；gru 补上 RNN 空缺，CPU H512×B4×L32 约 47 ms。补丁四要点：同一直接卷积的 Vulkan 后端以 fp32 跑完整声码器约 430–480 ms（对 ORT DML EP 326 ms），fp32 一致性比 DML 紧一个数量级（max|Δ| 6.1e-4 对 2.1e-3）。）
 
 ## 后端支持矩阵
 
@@ -93,7 +105,7 @@ git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch     # 补丁三�
 | `REL_POS_BIAS` | ✅ | ✅ | —（回落 CPU） | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅（add 需 `shaderBufferFloat32AtomicAdd`） | — | — |
 | `ADD_LEAKY_RELU` | ✅ | —（回落 CPU） | — | — |
-| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | —（回落 CPU） | — | — |
+| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | ✅ 补丁四（fp32，`K ≥ 3`，`(K−1)·dil ≤ 72`，否则回落 CPU） | — | — |
 
 补丁二：
 

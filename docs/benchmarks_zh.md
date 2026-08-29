@@ -96,9 +96,9 @@
 - CPU 版本是刻意保守的单线程参考实现（`n_tasks=1`），1–2.5 GFLOP/s 只作语义兜底——这两个算子在原生 ggml v0.19.0 中本来就没有 CPU 实现，属于"从无到有"。后续如有需求可并行化。
 - CUDA 的 `supports_op` 正确返回 false，上层可干净回落到 CPU。
 
-## `ADD_LEAKY_RELU` / `CONV_DIRECT_1D`（声码器端到端 + 微内核；在另一台机器上实测）
+## `ADD_LEAKY_RELU` / `CONV_DIRECT_1D`（声码器端到端 + 微内核）
 
-> 本节专用环境：Xeon E5-2675 v3（16C/32T Haswell-EP，AVX2 负载下持续 ~2.0 GHz）、Windows、MSVC 2019 `/O2`、fp32、CPU 后端（两算子设计上仅 CPU；其他后端 `supports_op` 拒绝）。计时 = 3 次完整运行取最优。消费侧挂具为 pc-nsf-hifigan.cpp 的 `hifigan_cli`（NSF-HiFiGAN：mel=128、5 级上采样、15 个 resblock、激活最大 `[881664, C]`），精度对照 ONNX Runtime CPU fp32 参考（同机 4 748 ms）。
+> 本节环境：Xeon E5-2675 v3（16C/32T Haswell-EP，AVX2 负载下持续 ~2.0 GHz）、Windows、MSVC 2019 `/O2`、fp32、CPU 后端。消费侧挂具为 pc-nsf-hifigan.cpp @ `f8c16ba` 的 `hifigan_cli`，ggml v0.19.0 + 补丁一，参考音频 T=1722（输出 881 664 采样），`PCNSF_TIMING=1` 墙钟、每路径 3 次取中位。精度对照 torch-CPU fp32 输出（offset 对齐；同机 ONNX Runtime CPU EP：9 次中位 5 155.0 ms）。
 
 微内核，单线程（K=11 形状的 direct-conv 内层循环，每行取最优变体）：
 
@@ -110,15 +110,20 @@
 
 标定值与最初内核间的 4× 差距来自 `inc → movsxd → imul` 地址链（每 tap 约 5 个串行周期）卡住 `vbroadcastss` 分发；指针递增消除之。距峰值的剩余 2× 是 FMA 关键路径上的广播 load-to-use 延迟——同一循环的寄存器驻留对照变体能跑到标定线，说明瓶颈是延迟而非带宽。
 
-声码器端到端，24 线程：
+声码器端到端，24 线程（3 次中位）：
 
-| 路径 | 耗时 | 对 ORT fp32 corr | max\|Δ\| |
+| 路径 | 耗时 (ms) | 对 torch-CPU fp32 corr | max\|Δ\| |
 |---|---|---|---|
-| 原生 `im2col` + `mul_mat`（`PCNSF_DIRECT_CONV=0`） | 10 038 ms | 0.99999999 | 1.490e-4 |
-| direct conv + `ADD_LEAKY_RELU`、无生产侧融合（`PCNSF_FUSE_IO=0`） | 5 973 ms | 0.99999999 | 1.492e-4 |
-| `conv_direct_1d_fused`（输入折入 + 残差 epilogue） | **4 764 ms** | 0.99999999 | 1.492e-4 |
+| 原生 `im2col` + `mul_mat`（`PCNSF_DIRECT_CONV=0`） | 80 002 | 0.99999999 | 1.490e-4 |
+| direct conv + `ADD_LEAKY_RELU`、无生产侧融合（`PCNSF_FUSE_IO=0`） | 31 772 | 0.99999999 | 1.492e-4 |
+| `conv_direct_1d_fused`（输入折入 + 残差 epilogue) | **28 030** | 0.99999999 | 1.492e-4 |
 
-三条路径数值等价（rms 同为 9.8e-6；max|Δ| 只在末位有差——FMA 排序噪声）。融合路径与 ONNX Runtime CPU EP 达到 CPU 持平（多次运行超出 0.3–1.6%）。生产侧融合把计算图从 252 节点减到 152（去掉 50 leaky、5 scale、45 残差 add），输出逐位一致。
+即直接卷积 + 融合相对原生 ggml 卷积路径 **2.85×**。三条路径数值等价（max|Δ| 只在末位有差——FMA 排序噪声）。生产侧融合把计算图从 252 节点减到 152（去掉 50 leaky、5 scale、45 残差 add），输出逐位一致。两点必须如实说明：
+
+- **ggml CPU 路径目前仍比 ONNX Runtime CPU EP 慢约 5.4×**（28.0 s 对 5.155 s）——ORT 的线程化 GEMM 在 Haswell 上调校得好得多。线程扩展也偏弱：融合路径 4 线程约 80 s、24 线程 28 s（6× 线程只换来 2.9×）。缩小该差距（改进分块 / level-0 `[881664, 256]` 级大激活的并行划分）是正在进行的工作；请把 2.85× 读作"赢过原生 ggml"，而非"已与 ORT CPU 同台"。
+- *勘误：* 本表旧版曾列 10 038 / 5 973 / 4 764 ms 并宣称与 ORT CPU 持平——那些数字记录于陈旧/不正确的构建配置，不可复现；上表取而代之（同机同模型，逐次重测的 3 次中位）。
+
+同一算子的 Vulkan 路径见下方补丁四一节。
 
 ## 方法论与已知陷阱
 
@@ -230,3 +235,41 @@
 6. 挂具规则同补丁一（每变体独立 backend + galloc、不走 sched）。Vulkan 的"每变体独立生命周期"要求再次得到确认：跨图形状复用 subcontext 会崩。
 7. Vulkan 上的 `snake` 复用原版 `snake_f32` pipeline（v0.19 基线自带图级 snake 融合、数学一致），fused 列测的是 **op 分发路径**而非新 shader。
 8. Vulkan/CPU 上 `channel_shuffle` 的组合链已接近最优单拷贝——speedup < 1 应读作"无收益空间"，不是缺陷。
+
+---
+
+# 补丁四 —— Vulkan `CONV_DIRECT_1D`（声码器端到端）
+
+> 环境：与上文声码器小节同机（Xeon E5-2675 v3，Windows，MSVC 2019），外加 RTX 2070（驱动 32.0.16.2002；warp 32，每 block 48 KiB 共享内存）。软件栈：ggml v0.19.0（`30bf868`）+ 补丁一、二、四（实测时补丁三尚未合入上游；补丁四与 Metal 补丁正交）+ pc-nsf-hifigan.cpp @ `f8c16ba`（`hifigan_cli`，分支 `wip/profile-nodes`）。全程 fp32 并刻意关闭张量核（`GGML_VK_DISABLE_COOPMAT2=1`，`hifigan_cli` 内部默认设置）：声码器契约对齐 torch-CPU 的 fp32 路径，而非 tf32/fp16 张量核算术。计时为 `PCNSF_TIMING=1` 的模型运行墙钟（不含 WAV IO），参考音频 T=1722（约 37.6 s @ 23.5 kHz，输出 881 664 采样）。
+
+端到端（各轮取中位）：
+
+| 路径 | 时间 (ms) | 对 torch-CPU fp32 输出的 corr | max|Δ| |
+|---|---|---|---|---|
+| ONNX Runtime CPU EP（9 次中位） | 5 155.0 | 0.9999999873 | — |
+| ONNX Runtime DML EP（9 次中位） | 325.8 | 0.99999697 | 2.09e-03 |
+| ggml Vulkan，补丁四（全部卷积过 supports_op 门控） | **433.2–435.0** | 0.99999985 | 6.13e-04 |
+| ggml Vulkan，`PCNSF_DIRECT_CONV=0`（全程回落 im2col） | 571–581 | 0.99999956 | — |
+
+关于该数字的说明：两组 3 次运行的中位为 433.2/435.0（单次 422.6–479.1）。后续在同机做了仅 host 侧的清理（移除 `ggml-vulkan.cpp` 里的调试环境钩子；shader 与图不变，输出**逐位一致**）后复测读数为 458–479 ms（中位 462，n=4）——该偏移是机器状态噪声（数小时编译后的频率/温度漂移），不是代码路径变化：SPIR-V 相同、输出字节相同。诚实引用区间：**≈ 430–480 ms**，DML 级别速度，而 fp32 一致性比 DML 本身紧一个数量级。
+
+分块变体扫描（同一次运行强制各 spec-constant 变体；变体只改分块策略，输出逐位一致）：
+
+| 变体 | e16 | e32 | w64 | w128（发布的默认选择） | e64 |
+|---|---|---|---|---|---|
+| 中位 ms | 635.6 | 493.9 | 570.1 | 442.0 | 398.2 |
+
+发布的按 OC 选择策略（≤16→e16，≤32→e32，否则 w128）在生产图上**作为整体**最优；一次依据单 shape 微基准提出的 K 感知改选使生产图回退到 488–1 432 ms，已还原。教训记录在案：变体集是协同调参的，单 shape 挂具基准不可外推到全图。
+
+`K ≥ 3` 门控是正确性边界而非偏好：shader 每块暂存 `XS_ROWS = 12` 行输入，`BK = 32` 的通道块跨 `⌊31/K⌋+1` 行输入——K = 2 时为 16 > 11 个可用槽位，循环窗口会覆写仍需的行。生产图有五个 K = 2 亚像素上采样卷积；强制它们上 shader（`PCNSF_DIRECT_MIN_K=1`，绕过消费方门控）会把 corr 确定性地打到 0.36。门控打开时它们回落到同样在 Vulkan 上的 `im2col`+`mul_mat`，成本已包含在上述 433–480 ms 内。
+
+复现（pc-nsf-hifigan.cpp @ `f8c16ba`，`build-vk`，源码树先按序应用补丁一、二、四）：
+
+```bat
+set GGML_VK_DISABLE_COOPMAT2=1   rem hifigan_cli 内部已默认
+set HF_RAW_OUT=vulkan_out.f32
+hifigan_cli.exe hifigan_f32.gguf mel.bin f0.bin out.wav
+python cmp_align.py vulkan_out.f32   rem 与 torch-CPU golden 做 offset 对齐 corr
+```
+
+21 例正确性挂具（`tools/test_conv_direct.cpp`，含生产 level-0 形状与链式/残差组合）在 Vulkan 路径对 CPU `_fused` 算子 21/21 通过，max|Δ| ≤ 5.5e-5。

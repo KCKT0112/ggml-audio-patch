@@ -170,7 +170,7 @@ struct ggml_tensor * ggml_conv_direct_1d_fused(  // + 残差、输入侧折入
 
 **后端**：设计上仅 CPU——Vulkan 上 GEMM 更强、保留 im2col 路径；其他后端 `supports_op` 拒绝 → 回落 CPU。
 
-**实测**（Xeon E5-2675 v3，16C/32T Haswell-EP，AVX2 负载下持续 ~2.0 GHz，MSVC 2019 `/O2`，fp32，24 线程，3 次取最优）：NSF-HiFiGAN 全量推理 10 038 ms（原生 im2col + `mul_mat`）→ **4 764 ms**（direct + 生产侧融合），2.1×；对 ONNX Runtime fp32 参考 corr 0.99999999 / max|Δ| 1.49e-4——与 im2col 路径精度一致（仅 FMA 排序噪声）。融合让计算图从 252 节点减到 152（去掉 50 leaky、5 scale、45 残差 add）。卷积聚合吞吐 ~290 GF/s；距线程数缩放的单线程速率的剩余差距是 FMA 关键路径上的广播 load-to-use 延迟（同一循环的寄存器驻留对照变体能跑到 2-FMA/cycle 标定线），不是内存带宽。
+**实测**（Xeon E5-2675 v3，16C/32T Haswell-EP，AVX2 负载 ~2.0 GHz，MSVC 2019 `/O2`，fp32，24 线程，3 次取中位；挂具 pc-nsf-hifigan.cpp @ `f8c16ba`）：NSF-HiFiGAN 全量推理 80 002 ms（原生 im2col + `mul_mat`）→ **28 030 ms**（direct + 生产侧融合），**2.85×**，对 torch-CPU fp32 输出 corr 0.99999999 / max|Δ| 1.49e-4——与 im2col 路径精度同级（仅 FMA 排序噪声）。融合从 252 节点中去掉 100 个（50 leaky、5 scale、45 残差 add）。如实说明差距：ONNX Runtime CPU EP 同模型 5 155 ms——ggml CPU 卷积路径目前落后约 5.4×（ORT 级别的线程化/分块优化是进行中的工作；本段旧版写的 4 764 ms 与 ORT 持平记录于陈旧构建，已更正）。单线程内层循环的指针递增教训依然成立：距线程扩展后峰值的剩余差距来自 FMA 关键路径上的广播 load-to-use 延迟（寄存器驻留对照变体能跑到 2 FMA/cycle 标定线），而非内存带宽。
 
 ## 后端支持矩阵（同首页）
 
@@ -181,7 +181,7 @@ struct ggml_tensor * ggml_conv_direct_1d_fused(  // + 残差、输入侧折入
 | `REL_POS_BIAS` | ✅ | ✅ | —（回落 CPU） | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅（add 需原子扩展） | — | — |
 | `ADD_LEAKY_RELU` | ✅ | —（回落 CPU） | — | — |
-| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | —（回落 CPU） | — | — |
+| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | ✅ 补丁四（fp32，`K ≥ 3`，`(K−1)·dil ≤ 72`，否则回落 CPU） | — | — |
 
 ## 上游跟进建议
 

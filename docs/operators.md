@@ -171,7 +171,7 @@ struct ggml_tensor * ggml_conv_direct_1d_fused(  // + residual, input-side fold
 
 **Backends**: CPU only by design — on Vulkan the GEMM is strong and the im2col path stays; other backends reject the op in `supports_op` → CPU fallback.
 
-**Measured** (Xeon E5-2675 v3, 16C/32T Haswell-EP, sustained ~2.0 GHz under AVX2 load, MSVC 2019 `/O2`, fp32, 24 threads, best of 3): full NSF-HiFiGAN inference 10 038 ms (stock im2col + `mul_mat`) → **4 764 ms** (direct + producer-side fusions), 2.1×, at corr 0.99999999 / max|Δ| 1.49e-4 vs the ONNX Runtime fp32 reference — the same accuracy as the im2col path (FMA-ordering noise only). The fusions removed 100 of 252 graph nodes (50 leaky, 5 scale, 45 residual add). Aggregate conv throughput ~290 GF/s; the residual gap to the thread-scaled single-thread rate is broadcast load-to-use latency on the FMA critical path (a register-resident control variant of the same loop reaches the 2-FMA/cycle calibration line), not memory bandwidth.
+**Measured** (Xeon E5-2675 v3, 16C/32T Haswell-EP, ~2.0 GHz sustained AVX2, MSVC 2019 `/O2`, fp32, 24 threads, median of 3; harness pc-nsf-hifigan.cpp @ `f8c16ba`): full NSF-HiFiGAN inference 80 002 ms (stock im2col + `mul_mat`) → **28 030 ms** (direct + producer-side fusions), **2.85×**, at corr 0.99999999 / max|Δ| 1.49e-4 vs the torch-CPU fp32 output — the same accuracy as the im2col path (FMA-ordering noise only). The fusions removed 100 of 252 graph nodes (50 leaky, 5 scale, 45 residual add). Honest gap: ONNX Runtime CPU EP runs the same model in 5 155 ms — the ggml CPU conv path is ~5.4× behind it today (ORT-level threading/blocking is the active workstream; a previous revision of this note quoting 4 764 ms at ORT parity was recorded against a stale build and has been corrected). On the single-thread inner loop the pointer-increment lesson still stands: the residual gap to the thread-scaled rate is broadcast load-to-use latency on the FMA critical path (a register-resident control variant reaches the 2-FMA/cycle calibration line), not memory bandwidth.
 
 ## Backend support matrix (mirrors the front page)
 
@@ -182,7 +182,7 @@ struct ggml_tensor * ggml_conv_direct_1d_fused(  // + residual, input-side fold
 | `REL_POS_BIAS` | ✅ | ✅ | — (CPU fallback) | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅ (add needs the atomic ext) | — | — |
 | `ADD_LEAKY_RELU` | ✅ | — (CPU fallback) | — | — |
-| `CONV_DIRECT_1D` (+`_fused`) | ✅ | — (CPU fallback) | — | — |
+| `CONV_DIRECT_1D` (+`_fused`) | ✅ | ✅ patch 4 (fp32, `K ≥ 3`, `(K−1)·dil ≤ 72`; else CPU fallback) | — | — |
 
 ## Upstream follow-up suggestions
 

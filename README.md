@@ -13,7 +13,7 @@ A curated patch set that ports **sixteen audio-domain operators** into [ggml](ht
 | `GGML_OP_REL_POS_BIAS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR) (R bindings for ggml) | BoTNet-style two-axis relative-position attention bias: per-axis displacement lookup + per-channel dot product, with CPU and Vulkan implementations. |
 | `GGML_OP_SCATTER_ELEMENTS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR) | ONNX `ScatterElements` semantics — the inverse of `get_rows`. Vulkan implements the additive reduction with `VK_EXT_shader_atomic_float` atomics. |
 | `GGML_OP_ADD_LEAKY_RELU` | authored for [pc-nsf-hifigan.cpp](https://github.com/KakaruHayate/pc-nsf-hifigan.cpp) (NSF-HiFiGAN vocoder) | `y = leaky(a + b)` in one pass — broadcast `[1,C]` or rowwise `[T,C]` bias; bit-identical to `add` + `leaky_relu`. Also un-serializes the stock CPU `leaky_relu` kernel (`n_tasks` was forced to 1). |
-| `GGML_OP_CONV_DIRECT_1D` (+`_fused`) | authored for pc-nsf-hifigan.cpp | Stride-1 direct 1-D conv with no im2col scratch: weight packed to `[IC·K, OCp]` once per call, AVX2 6×16 micro-kernel with pointer-increment addressing (+26% single-thread vs `imul`-indexed). `_fused` folds bias / residual / output-leaky and input-side `leaky·scale` **bit-identically** — 2.1× on the full vocoder (10.0 s → 4.8 s, 24 threads, 16C/32T). |
+| `GGML_OP_CONV_DIRECT_1D` (+`_fused`) | authored for pc-nsf-hifigan.cpp | Stride-1 direct 1-D conv with no im2col scratch: weight packed to `[IC·K, OCp]` once per call, AVX2 6×16 micro-kernel with pointer-increment addressing (+26% single-thread vs `imul`-indexed). `_fused` folds bias / residual / output-leaky and input-side `leaky·scale` **bit-identically** — 2.85× on the full vocoder (80.0 s → 28.0 s, 24 threads, 16C/32T). |
 
 ## Patch 2 — the ten qvac fused operators
 
@@ -38,6 +38,16 @@ Applies **on top of patch 2**. It wires the five Supertonic kernels and direct `
 
 `GRU` / `ZERO_UPSAMPLE` / `CHANNEL_SHUFFLE` / `AFFINE_PRELU` / `SNAKE` also have Vulkan compute-shader implementations; `GRU` additionally has register-resident small-H variants (H = 2/4/8) and caps at H ≤ 128 (shared-memory).
 
+## Patch 4 — Vulkan compute backend for `CONV_DIRECT_1D`
+
+Applies **on top of patches 1 and 2** (patch 2 occupies the same shader-registry and dispatch insertion points, so the order 1 → 2 → 4 is required; patch 3 is Metal-only and orthogonal — with or without it, patch 4 applies the same way). This is the GPU half of the vocoder work from patch 1: it does not change any operator semantics — `tests/test_learned_ops.c` remains the frozen contract.
+
+- `vulkan-shaders/conv_direct_1d.comp` — implicit-GEMM stride-1 direct 1-D conv, fp32 only. One SPIR-V binary; the warp tile is passed as Vulkan specialization constants (the `mul_mm` scheme), producing five concrete pipelines. `ggml_vk_op_get_pipeline` picks the tile per node by output-channel count (OC ≤ 16 → e16, ≤ 32 → e32, else w128); **every variant is numerically correct for any shape**, the pick is a pure performance heuristic and makes no vendor-specific assumptions.
+- Bias, residual, output-leaky and input-side `leaky·scale` fusions are honored exactly like the CPU `_fused` op (same op_params contract).
+- `supports_op` gate: fp32 + contiguous, `K ≥ 3` and `(K−1)·dilation ≤ 72` (the shared-memory halo cap); anything else returns false so schedulers fall back to the CPU kernel. **Consumers that drive ggml-vulkan in raw graph mode** (calling `ggml_vk_build_graph` directly, bypassing the scheduler's `supports_op` check) must enforce the same gate themselves — the K = 2 subpixel-upsample convs in NSF-HiFiGAN exceed the shader's staged-row window and would silently produce wrong output. pc-nsf-hifigan.cpp does this with `PCNSF_DIRECT_MIN_K` (Vulkan default 3, other backends 1).
+
+Measured on the full NSF-HiFiGAN vocoder (RTX 2070, driver 32.0.12.x-class, fp32 throughout, `GGML_VK_DISABLE_COOPMAT2=1` so tensor cores stay off; median of repeated runs of the pc-nsf-hifigan.cpp `hifigan_cli` on the reference clip): **≈ 433–479 ms end-to-end** vs. 326 ms for ONNX Runtime's DML EP and 5 155 ms for its CPU EP on the same box. Accuracy against the torch-CPU reference: corr 0.99999985, max|Δ| 6.1e-4 — an order of magnitude tighter than ORT-DML on the same clip (corr 0.99999697, max|Δ| 2.1e-3). Full numbers and repro commands in [docs/benchmarks.md](docs/benchmarks.md#patch-4-vulkan-conv_direct_1d).
+
 Base tree: ggml [`30bf868`](https://github.com/ggml-org/ggml) (v0.19.0). The diffs are additive at enum/builder/kernel insertion points, so applying onto nearby commits usually needs only light conflict resolution.
 
 ## Repository layout
@@ -47,7 +57,8 @@ ggml-audio-patch/
 ├── patches/
 │   ├── learned-ops-ggml0190.patch   # unified diff against ggml v0.19.0 (patch 1)
 │   ├── qvac-ops-ggml0190.patch      # unified diff on top of patch 1 (patch 2)
-│   └── metal-ops-ggml0190.patch     # Metal integration on top of patch 2 (patch 3)
+│   ├── metal-ops-ggml0190.patch     # Metal integration on top of patch 2 (patch 3)
+│   └── vulkan-conv-direct-1d-ggml0190.patch  # Vulkan backend for CONV_DIRECT_1D (patch 4, on top of 1+2)
 ├── tests/
 │   ├── test_learned_ops.c           # patch-1 correctness smoke tests (hand-computed references)
 │   ├── test_qvac_ops.c              # patch-2 correctness smoke tests (cpu | vk | metal harness hook)
@@ -71,16 +82,17 @@ ggml-audio-patch/
 ```bash
 git clone https://github.com/ggml-org/ggml.git ggml-src
 cd ggml-src && git checkout 30bf868        # v0.19.0
-git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch   # patch 1
-git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch      # patch 2 (sequential, on top)
-git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch     # patch 3 (Metal, optional)
+git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch            # patch 1
+git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch               # patch 2 (sequential, on top)
+git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch              # patch 3 (Metal, optional)
+git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # patch 4 (on top of 1+2)
 ```
 
-Apply the patches in order. Patch 3 is optional on non-Metal platforms; patch 2 must follow patch 1.
+Patch 2 must follow patch 1: they touch the same enum-assert and dispatch hunks. Patch 3 is optional on non-Metal platforms. Patch 4 must follow patches 1 and 2: it consumes `CONV_DIRECT_1D` from patch 1 and shares shader-registry/dispatch insertion points with patch 2 (it is orthogonal to patch 3 — apply it with or without the Metal patch). Applying only patch 1 is fine (skip the rest); applying only 1+4 is **not** supported.
 
 Then configure / build / test — see **[docs/building.md](docs/building.md)** for prerequisites (Vulkan SDK, CUDA toolkit, Windows generator choice) and per-backend commands, or run the bundled `scripts/build-and-test.sh` / `build-and-test.ps1`.
 
-Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path; 2.1× for `CONV_DIRECT_1D`+fusions on the full NSF-HiFiGAN vocoder (10 038 → 4 764 ms, 24 threads on a 16C/32T Xeon E5-2675 v3) at bit-parity with the im2col path. Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.80× on Apple M4 Metal; Snake reaches 3.05× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.24×; affine_prelu up to 6.3× Vulkan; gru fills the RNN gap at ~47 ms for H512×B4×L32 on CPU.)
+Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path; 2.85× for `CONV_DIRECT_1D`+fusions on the full NSF-HiFiGAN vocoder (80 002 → 28 030 ms, 24 threads on a 16C/32T Xeon E5-2675 v3; still ~5.4× behind the ONNX Runtime CPU EP — see docs for the honest gap). Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.80× on Apple M4 Metal; Snake reaches 3.05× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.24×; affine_prelu up to 6.3× Vulkan; gru fills the RNN gap at ~47 ms for H512×B4×L32 on CPU. Patch-4 headline: the direct conv's Vulkan backend runs the vocoder end-to-end in ≈ 430–480 ms fp32 (vs ORT DML EP 326 ms), with 10× tighter fp32 agreement than DML (max|Δ| 6.1e-4 vs 2.1e-3).)
 
 ## Backend support matrix
 
@@ -93,7 +105,7 @@ Patch 1:
 | `REL_POS_BIAS` | ✅ | ✅ | — falls back to CPU | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅ (`add` needs `shaderBufferFloat32AtomicAdd`) | — | — |
 | `ADD_LEAKY_RELU` | ✅ | — falls back to CPU | — | — |
-| `CONV_DIRECT_1D` (+`_fused`) | ✅ | — falls back to CPU | — | — |
+| `CONV_DIRECT_1D` (+`_fused`) | ✅ | ✅ patch 4 (fp32, `K ≥ 3`, `(K−1)·dil ≤ 72`; else CPU fallback) | — | — |
 
 Patch 2:
 
