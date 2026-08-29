@@ -160,6 +160,33 @@
 
 五个 Vulkan shader 算子符合设计预期：`snake` 与 `affine_prelu`——两个替代"多 kernel 广播链"的——拿到真实 GPU 收益（最高 3.9× 与 6.3×）；拷贝类（`channel_shuffle`、`zero_upsample`）在 GPU 上组合链本就融为单次拷贝，比值在 1.0 附近。
 
+## 融合 vs 组合（Metal，Apple M4）
+
+- 平台：Apple M4（10 核 GPU）、macOS 27.0（26A5421a）、Xcode 27.0（27A5237l）、Apple Clang 21.0.0。
+- 软件栈：ggml v0.19.0（`30bf868`）+ 补丁一、补丁二、补丁三。
+- 方法：独立运行三个进程。每个进程预热 3 次，对 20 次 `ggml_backend_graph_compute` 计时取中位数；表中再取三轮中位数。基准逐节点检查 `ggml_backend_supports_op`，不包含任何 CPU 回落。
+
+| case | fused ms | composed ms | speedup |
+|---|---:|---:|---:|
+| snake 2048×64 | 0.241 | 0.282 | 1.17× |
+| snake 8192×128 | 0.327 | 0.996 | **3.05×** |
+| snake 32768×32 | 0.310 | 0.920 | **2.97×** |
+| bias_gelu 1024×256 | 0.256 | 0.288 | 1.13× |
+| bias_gelu 4096×512 | 0.458 | 0.880 | 1.92× |
+| bias_gelu 1024×1024 | 0.339 | 0.660 | 1.95× |
+| pw2_residual 1024×256 | 0.260 | 0.368 | 1.42× |
+| pw2_residual 4096×512 | 0.636 | 1.396 | **2.19×** |
+| depthwise_1d 4096×64 K7 | 0.241 | 0.655 | **2.72×** |
+| depthwise_1d 16384×128 K7 | 0.502 | 2.913 | **5.80×** |
+| edge_pad_1d 4096×64 p3/3 | 0.179 | 0.250 | 1.40× |
+| edge_pad_1d 16384×128 p7/7 | 0.463 | 0.711 | 1.54× |
+| LN_channel 1024×256 | 0.281 | 0.568 | **2.02×** |
+| LN_channel 4096×512 | 1.029 | 3.332 | **3.24×** |
+
+最大实测收益是大尺寸 depthwise 的 5.80×；Snake 最高 3.05×，大尺寸通道 layer norm 为 3.24×。edge padding 提速 1.40–1.54×。
+
+供体没有 Metal kernel 的四个融合算子仍不受支持。其纯组合 Metal 基线可以测量：两组形状中，affine-PReLU 为 0.723 / 4.616 ms，channel-shuffle 为 0.375 / 2.148 ms，zero-upsample 为 0.234 / 0.237 ms；由于没有融合 kernel，不宣称加速比。GRU 仍为 SKIP。
+
 ## `GRU`（绝对性能；原版无对应实现）
 
 | 后端 | H | B | L | reverse | ms |

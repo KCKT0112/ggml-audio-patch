@@ -1,6 +1,6 @@
 // Benchmark: qvac-ops fused kernels vs equivalent composed sub-graphs.
 //
-// Usage: bench_qvac_ops [cpu|vulkan] [threads]
+// Usage: bench_qvac_ops [cpu|vulkan|metal] [threads]
 //
 // Measures end-to-end graph_compute time (median over repeats):
 //   1. snake            vs  mul+sin+sqr+mul+add chain (the 5-op subgraph the
@@ -50,6 +50,9 @@ static double now_s(void) {
 ggml_backend_t             ggml_backend_vk_init(size_t dev_num);
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
 #endif
+#ifdef USE_METAL
+ggml_backend_t ggml_backend_metal_init(void);
+#endif
 
 static const char * g_backend = "cpu";
 static int g_threads = 8;
@@ -78,6 +81,14 @@ static void bench_begin(struct bench * b) {
         return;
     }
 #endif
+#ifdef USE_METAL
+    if (strcmp(g_backend, "metal") == 0) {
+        b->backend = ggml_backend_metal_init();
+        GGML_ASSERT(b->backend && "USE_METAL build but Metal initialization failed");
+        b->buft = ggml_backend_get_default_buffer_type(b->backend);
+        return;
+    }
+#endif
     b->backend = ggml_backend_cpu_init();
     b->buft = ggml_backend_cpu_buffer_type();
     ggml_backend_cpu_set_n_threads(b->backend, g_threads);
@@ -86,6 +97,11 @@ static void bench_begin(struct bench * b) {
 static bool bench_graph(struct bench * b, struct ggml_tensor * root) {
     b->gf = ggml_new_graph(b->ctx);
     ggml_build_forward_expand(b->gf, root);
+    for (int i = 0; i < ggml_graph_n_nodes(b->gf); i++) {
+        if (!ggml_backend_supports_op(b->backend, ggml_graph_node(b->gf, i))) {
+            return false;
+        }
+    }
     b->galloc = ggml_gallocr_new(b->buft);
     if (!ggml_gallocr_alloc_graph(b->galloc, b->gf)) {
         printf("  galloc failed\n");

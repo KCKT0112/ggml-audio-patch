@@ -160,6 +160,33 @@ Benchmarks produced by `tests/bench_qvac_ops.c` (`fused` = the new single-dispat
 
 The five Vulkan shader ops behave as designed: `snake` and `affine_prelu` — the two that replace multi-kernel broadcast chains — show the real GPU wins (up to 3.9× and 6.3×); copy-class ops (`channel_shuffle`, `zero_upsample`) hover at parity since the composed chains already fuse into single copies on GPU.
 
+## Fused vs composed (Metal, Apple M4)
+
+- Platform: Apple M4 (10-core GPU), macOS 27.0 (26A5421a), Xcode 27.0 (27A5237l), Apple Clang 21.0.0.
+- Stack: ggml v0.19.0 (`30bf868`) + patches 1, 2, and 3.
+- Method: three independent process runs. Each process uses 3 warmups and the median of 20 timed `ggml_backend_graph_compute` calls; the table reports the median of the three per-process medians. Every graph node is checked with `ggml_backend_supports_op`, so no CPU fallback is included.
+
+| case | fused ms | composed ms | speedup |
+|---|---:|---:|---:|
+| snake 2048×64 | 0.241 | 0.282 | 1.17× |
+| snake 8192×128 | 0.327 | 0.996 | **3.05×** |
+| snake 32768×32 | 0.310 | 0.920 | **2.97×** |
+| bias_gelu 1024×256 | 0.256 | 0.288 | 1.13× |
+| bias_gelu 4096×512 | 0.458 | 0.880 | 1.92× |
+| bias_gelu 1024×1024 | 0.339 | 0.660 | 1.95× |
+| pw2_residual 1024×256 | 0.260 | 0.368 | 1.42× |
+| pw2_residual 4096×512 | 0.636 | 1.396 | **2.19×** |
+| depthwise_1d 4096×64 K7 | 0.241 | 0.655 | **2.72×** |
+| depthwise_1d 16384×128 K7 | 0.502 | 2.913 | **5.80×** |
+| edge_pad_1d 4096×64 p3/3 | 0.179 | 0.250 | 1.40× |
+| edge_pad_1d 16384×128 p7/7 | 0.463 | 0.711 | 1.54× |
+| LN_channel 1024×256 | 0.281 | 0.568 | **2.02×** |
+| LN_channel 4096×512 | 1.029 | 3.332 | **3.24×** |
+
+The largest measured gain is 5.80× for the large depthwise case. Snake reaches 3.05× and large channel layer norm reaches 3.24×. Edge padding gains 1.40–1.54×.
+
+The four operators without donor Metal kernels remain unsupported as fused ops. Their composed Metal baselines were measurable — affine-PReLU 0.723 / 4.616 ms, channel-shuffle 0.375 / 2.148 ms, and zero-upsample 0.234 / 0.237 ms for the two listed shapes — but no fused speedup is claimed. GRU remains SKIP.
+
 ## `GRU` (absolute; no stock equivalent exists)
 
 | backend | H | B | L | reverse | ms |

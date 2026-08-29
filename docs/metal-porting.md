@@ -2,9 +2,9 @@
 
 > English | **[中文](metal-porting_zh.md)**
 
-How to bring the ten qvac operators (patch 2) to Apple's Metal backend, how
-to verify the result, and the acceptance criteria a Metal port must meet
-before it can be merged as `patches/metal-ops-ggml0190.patch`.
+How to bring the six qvac operators with donor kernels to Apple's Metal
+backend, preserve clean fallback for the other four patch-2 operators, verify
+the result, and regenerate `patches/metal-ops-ggml0190.patch`.
 
 Read **[/AGENTS.md](../AGENTS.md) first** — it defines the editing
 boundaries every contributor (human or agent) works under. Short version:
@@ -16,16 +16,17 @@ glue is yours to write.
 
 | Operator | CPU | Vulkan | Metal |
 |---|---|---|---|
-| Supertonic × 5 | ✅ | — (CPU fallback) | 📋 reference available, **not wired** |
+| Supertonic × 5 | ✅ | — (CPU fallback) | ✅ patch 3, F32 |
 | GRU / ZERO_UPSAMPLE / CHANNEL_SHUFFLE / AFFINE_PRELU | ✅ | ✅ | ❌ no upstream kernel exists |
-| SNAKE | ✅ | ✅ | 📋 reference available, **not wired** |
+| SNAKE | ✅ | ✅ | ✅ patch 3, F32 |
 
-Patch 2 ships **no Metal integration**: `ggml-metal-device.m`'s
-`supports_op` has no cases for the ten ops, so its `default: return false`
-keeps every one of them on the clean CPU fallback. macOS users lose nothing
-today; they gain nothing yet either. `metal-reference/` contains the
-upstream-verified kernel sources and all host-side glue, ready to be wired
-in.
+Patch 2 intentionally ships no Metal integration. The optional sequential
+`patches/metal-ops-ggml0190.patch` (patch 3) wires the six kernels that exist
+in the donor and keeps the other four ops on the clean CPU fallback.
+`metal-reference/` remains the frozen provenance for the integrated kernels
+and host-side ABI. Patch 3 also restores the baseline Metal `GGML_OP_REPEAT`
+gate, which patch 1 had accidentally coupled to the stricter grouped/padded
+`CONV_TRANSPOSE_1D` gate; this is required for pure-Metal composed baselines.
 
 ## Why the reference should integrate cleanly
 
@@ -49,7 +50,7 @@ places besides the three "append" locations.
 ## Prerequisites (the only way to verify)
 
 - macOS 13+, Apple Silicon (or AMD) GPU, Xcode 15+ toolchain.
-- The patched tree: v0.19.0 + patch 1 + patch 2 (`git apply` in order).
+- The patched tree: v0.19.0 + patch 1 + patch 2 + patch 3 (`git apply` in order).
 - A CPU build that works first: `cmake -B build-metal -DGGML_METAL=ON ...`
   and `test_qvac_ops_cpu cpu` passing — Metal work starts from a green CPU
   baseline.
@@ -99,14 +100,16 @@ Metal variant (macOS only):
 ```bash
 clang -O2 -DUSE_METAL -I ggml-src/include -I ggml-src/src \
   -o test_qvac_ops_metal tests/test_qvac_ops.c \
-  -L ggml-src/build-metal/src -lggml-base -lggml-cpu -lggml-metal \
+  -L ggml-src/build-metal/src -L ggml-src/build-metal/src/ggml-metal \
+  -lggml-base -lggml-cpu -lggml-metal \
   -framework Foundation -framework Metal -framework MetalKit
 ./test_qvac_ops_metal metal
 ```
 
-With gates off (as shipped), every case prints `SKIP: metal does not
-support this op shape` and exits `ALL PASSED` — that is the correct
-pre-integration state and doubles as your fallback sanity check.
+Without patch 3, every case prints `SKIP: metal does not support this op
+shape`. With patch 3, the 18 Supertonic/Snake cases execute on Metal, while
+the 16 GRU/zero-upsample/channel-shuffle/affine-PReLU cases still print the
+expected clean-fallback `SKIP` messages.
 
 ## Verification procedure (per op, after enabling its gate)
 
@@ -141,8 +144,8 @@ already embedded in the test — no extra work needed.
 4. **Gate discipline**: `supports_op` returns true only for the exact
    (type, shape, param) envelope that passed criterion 1 — not a superset.
 5. **Kernel diff discipline**: `git diff metal-reference/` in your branch
-   is empty (kernels untouched; AGENTS.md rules 3–4). All changes live in
-   the four integration files + the supports_op gate.
+   is empty (kernels untouched; AGENTS.md rules 3–4). Integration changes
+   live in the seven Metal implementation/header/shader files.
 6. **Determinism**: run the Metal suite twice; both runs identical.
 7. **Platform statement**: PR description lists OS version, chip/GPU,
    Xcode version, and the verbatim tail of `test_qvac_ops_metal metal`
@@ -160,7 +163,11 @@ already embedded in the test — no extra work needed.
   change per AGENTS.md rule 4).
 - **`layer_norm_channel` threadgroup**: `nth` must be a multiple of 32
   (simdgroup) and ≤ 256; the reference dispatcher already computes it that
-  way. Shared memory is `8 * sizeof(float)` — one float per simdgroup.
+  way. Shared memory is `8 * sizeof(float)` — one float per simdgroup. The
+  integrated kernel adds a barrier after every simdgroup consumes the reduced
+  mean and before variance partials reuse `shared[0]`. The donor omitted this
+  barrier; C=256/L=4096 stress testing reproduced wrong results in 9/10
+  independent processes without it and passed 20/20 with it.
 - **`depthwise_1d` peelings are compile-time** on K ∈ {3, 5, 7}; any other
   K falls through the `else` branch treating it as K=3 — the supports_op
   gate must reject other K values (upstream gates on K ∈ {3,5,7}; do the
@@ -171,9 +178,10 @@ already embedded in the test — no extra work needed.
   1e-4 test tolerance absorbs the polynomial difference; do not "fix" the
   kernel to exact `erff` — that would break bit-identity with the
   unfused Metal gelu path.
-- **`snake` grid-stride**: dispatcher caps threadgroups at 65535 and relies
-  on the grid-stride loop for larger N — don't "simplify" it to a
-  one-thread-one-element dispatch.
+- **`snake` baseline overlap**: v0.19.0 already contains a type-generic
+  `kernel_snake` used by composed-graph fusion. Patch 3 reuses that identical
+  formula and pipeline for direct `GGML_OP_SNAKE` dispatch instead of adding
+  a duplicate `kernel_snake_f32` symbol.
 - **Placeholder buffer binding**: `depthwise_1d` with `bias == NULL` binds
   `src[0]` at index 3 as a placeholder (Metal requires all declared
   buffers bound). Keep it.
@@ -187,6 +195,27 @@ already embedded in the test — no extra work needed.
   2), `metal-reference/*` (rule 3/4), or patch 2 directly.
 - Do not commit local paths (`/Users/...`) or non-reproducible claims.
 
-Once your branch meets the checklist, the integration becomes
-`patches/metal-ops-ggml0190.patch` (sequential on top of patch 2) via the
-standard regeneration procedure (AGENTS.md artifact table).
+The checked-in `patches/metal-ops-ggml0190.patch` is generated from a
+dedicated commit sequentially on top of patch 2. Regenerate it with the
+standard AGENTS.md procedure after any integration change.
+
+## Verified delivery
+
+Verified on 2026-08-29 with macOS 27.0 (26A5421a), Apple M4 (10-core GPU),
+Xcode 27.0 (27A5237l), and Apple Clang 21.0.0:
+
+- patch 1 → patch 2 → patch 3 applies cleanly to pristine `30bf868`;
+- Metal build succeeds and all 18 enabled Metal cases execute without SKIP;
+- the 16 cases for the four ops without Metal kernels cleanly SKIP;
+- explicit gates reject depthwise K=9, invalid layouts, mixed Snake types,
+  and all four kernel-less ops;
+- `test_qvac_ops_metal cpu`, `test_qvac_ops_cpu cpu`, and
+  `test_learned_ops_cpu cpu` report `ALL PASSED`;
+- two Metal runs have identical test-result projections and both end with:
+
+```text
+[test] metal supports_op gates / fallback envelope
+  done (0 failures so far)
+
+ALL PASSED
+```
