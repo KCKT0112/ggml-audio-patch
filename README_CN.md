@@ -2,7 +2,7 @@
 
 > 中文 | **[English](README.md)**
 
-一套精选补丁，把来自 ggml 生态不同项目的**十四个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：API 对齐上游规范、修复了原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA 支持。以两个顺序应用的统一 diff + 正确性测试 + 跨后端基准程序交付。
+一套精选补丁，把来自 ggml 生态不同项目的**十四个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：API 对齐上游规范、修复了原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持。以三个顺序应用的统一 diff + 正确性测试 + 跨后端基准程序交付。
 
 ## 补丁一：四个 learned 算子
 
@@ -30,7 +30,11 @@
 | `GGML_OP_AFFINE_PRELU` | LavaSR 降噪器 | 逐通道仿射 + PReLU 单次完成。 |
 | `GGML_OP_SNAKE` | ACE-Step Oobleck VAE | snake 激活 `y = x + sin²(a·x)·inv_b`，逐通道参数。 |
 
-五个 supertonic 算子此处仅 CPU 实现（上游 qvac 为 Metal 内核，Metal 移植留待后续）；`GRU` / `ZERO_UPSAMPLE` / `CHANNEL_SHUFFLE` / `AFFINE_PRELU` / `SNAKE` 五个另有 Vulkan compute shader 实现，`GRU` 额外带 H = 2/4/8 的寄存器驻留变体，共享内存上限 H ≤ 128。
+## 补丁三：已验证的 Metal 集成
+
+**叠加在补丁二之上**。它把五个 Supertonic kernel 和直接 `GGML_OP_SNAKE` 分发接入 Metal，并用严格的 F32/形状/参数门控限定支持范围。`GRU` / `ZERO_UPSAMPLE` / `CHANNEL_SHUFFLE` / `AFFINE_PRELU` 因供体没有 Metal kernel，仍干净回落 CPU。验证矩阵和平台证据见 [docs/metal-porting_zh.md](docs/metal-porting_zh.md)。
+
+`GRU` / `ZERO_UPSAMPLE` / `CHANNEL_SHUFFLE` / `AFFINE_PRELU` / `SNAKE` 五个另有 Vulkan compute shader 实现，`GRU` 额外带 H = 2/4/8 的寄存器驻留变体，共享内存上限 H ≤ 128。
 
 基线：ggml [`30bf868`](https://github.com/ggml-org/ggml)（v0.19.0）。diff 只在枚举/builder/kernel 的插入点上做增量，应用到邻近 commit 通常只需少量冲突处理。
 
@@ -40,13 +44,14 @@
 ggml-audio-patch/
 ├── patches/
 │   ├── learned-ops-ggml0190.patch   # 基于 ggml v0.19.0 的统一 diff（补丁一）
-│   └── qvac-ops-ggml0190.patch      # 叠加在补丁一之上的统一 diff（补丁二）
+│   ├── qvac-ops-ggml0190.patch      # 叠加在补丁一之上的统一 diff（补丁二）
+│   └── metal-ops-ggml0190.patch     # 叠加在补丁二之上的 Metal 集成（补丁三）
 ├── tests/
 │   ├── test_learned_ops.c           # 补丁一正确性冒烟测试（手写参考值对照）
 │   ├── test_qvac_ops.c              # 补丁二正确性测试（cpu | vk | metal 挂具钩子）
 │   ├── bench_learned_ops.c          # 补丁一 CPU / Vulkan / CUDA 微基准
-│   └── bench_qvac_ops.c             # 补丁二 融合 vs 组合图 基准（CPU + Vulkan）
-├── metal-reference/                 # 上游提取的 Metal kernel + host 胶水（未接线；见 docs/metal-porting_zh.md）
+│   └── bench_qvac_ops.c             # 补丁二 融合 vs 组合图 基准（CPU + Vulkan + Metal）
+├── metal-reference/                 # 补丁三采用的冻结上游来源（见 docs/metal-porting_zh.md）
 │   ├── supertonic_ops.metal         # 6 个 kernel，逐字取自 qvac（MIT），冻结参考
 │   └── host-side.cpp                # kargs 结构体、pipeline 查找、分发函数、supports_op 门控
 ├── scripts/
@@ -68,13 +73,14 @@ git clone https://github.com/ggml-org/ggml.git ggml-src
 cd ggml-src && git checkout 30bf868        # v0.19.0
 git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch   # 补丁一
 git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch      # 补丁二（顺序应用）
+git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch     # 补丁三（Metal，可选）
 ```
 
-补丁二必须跟在补丁一之后：两者触碰相同的枚举断言与分发代码块。只用补丁一也可以（跳过第二行）。
+三个补丁必须按顺序应用。非 Metal 平台可不应用补丁三；补丁二必须跟在补丁一之后。
 
 配置 / 编译 / 测试见 **[docs/building_zh.md](docs/building_zh.md)**（含 Vulkan SDK、CUDA 工具链、Windows 生成器选择等注意事项），或直接跑 `scripts/build-and-test.sh` / `build-and-test.ps1`。
 
-性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×。补丁二要点：depthwise-1d 融合版 CPU 提速 19–30×；snake CPU 2.2–4.6× / Vulkan 最高 3.9×；affine_prelu Vulkan 最高 6.3×；gru 补上 RNN 空缺，CPU H512×B4×L32 约 47 ms。）
+性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.49×；Snake 在 Metal 达 3.90×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.18×。）
 
 ## 后端支持矩阵
 
@@ -91,18 +97,18 @@ git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch      # 补丁二�
 
 | 算子 | CPU | Vulkan | CUDA | Metal |
 |---|---|---|---|---|
-| `SUPERTONIC_DEPTHWISE_1D`（含 `_ct` / `_causal_ct`） | ✅ | —（回落 CPU） | — | — |
-| `SUPERTONIC_LAYER_NORM_CHANNEL`（含 `_ct`） | ✅ | — | — | — |
-| `SUPERTONIC_PW2_RESIDUAL`（含 `_ct`） | ✅ | — | — | — |
-| `SUPERTONIC_BIAS_GELU`（含 `_ct`） | ✅ | — | — | — |
-| `SUPERTONIC_EDGE_PAD_1D`（含 `_ct`） | ✅ | — | — | — |
+| `SUPERTONIC_DEPTHWISE_1D`（含 `_ct` / `_causal_ct`） | ✅ | —（回落 CPU） | — | ✅ F32，K ∈ {3,5,7} |
+| `SUPERTONIC_LAYER_NORM_CHANNEL`（含 `_ct`） | ✅ | — | — | ✅ F32 |
+| `SUPERTONIC_PW2_RESIDUAL`（含 `_ct`） | ✅ | — | — | ✅ F32 |
+| `SUPERTONIC_BIAS_GELU`（含 `_ct`） | ✅ | — | — | ✅ F32 |
+| `SUPERTONIC_EDGE_PAD_1D`（含 `_ct`） | ✅ | — | — | ✅ F32 |
 | `GRU` | ✅ | ✅ H ≤ 128（含 H=2/4/8 变体） | — | — |
 | `ZERO_UPSAMPLE` | ✅ | ✅ | — | — |
 | `CHANNEL_SHUFFLE` | ✅ | ✅ | — | — |
 | `AFFINE_PRELU` | ✅ | ✅ | — | — |
-| `SNAKE` | ✅ | ✅ | — | — |
+| `SNAKE` | ✅ | ✅ | — | ✅ F32 |
 
-（上游 qvac 中 supertonic 五件套是 Metal 内核、后五件是 Vulkan shader；本移植保留 Vulkan 五件套，Metal 在验证过的移植落地前全部关闭——上游 Metal kernel 与 host 侧胶水已保存在 [`metal-reference/`](metal-reference/)，集成步骤、验证方法与验收标准见 [docs/metal-porting_zh.md](docs/metal-porting_zh.md)；CUDA 亦关闭——上游同样没有 CUDA 实现。人类与 agent 的贡献/编辑边界：[AGENTS.md](AGENTS.md)。）
+（补丁三接入供体的五个 Supertonic Metal kernel 和直接 Snake 分发；另外四个 qvac 算子没有供体 Metal kernel，仍显式关闭。冻结来源、集成说明、验证证据和验收标准见 [`metal-reference/`](metal-reference/) 与 [docs/metal-porting_zh.md](docs/metal-porting_zh.md)。CUDA 仍关闭，与供体一致。贡献与编辑边界：[AGENTS.md](AGENTS.md)。）
 
 不支持的参数组合由各后端 `supports_op` 显式拒绝，计算图会干净地回落到 CPU 后端，而不是产出错误结果。
 

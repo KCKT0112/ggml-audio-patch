@@ -22,9 +22,10 @@ cd ggml-src
 git checkout 30bf868                       # v0.19.0
 git apply <本仓库路径>/patches/learned-ops-ggml0190.patch   # 补丁一（必需）
 git apply <本仓库路径>/patches/qvac-ops-ggml0190.patch      # 补丁二（可选，顺序应用）
+git apply <本仓库路径>/patches/metal-ops-ggml0190.patch     # 补丁三（可选 Metal 集成）
 ```
 
-补丁二必须**在补丁一之后**应用（两者触碰相同的枚举断言与分发代码块）。只用补丁一完全可行；不存在"只用补丁二"的用法。
+补丁二必须**在补丁一之后**应用（两者触碰相同的枚举断言与分发代码块），补丁三必须跟在补丁二之后。只用补丁一完全可行；补丁二或补丁三都不能脱离前序补丁单独使用。
 
 下文中所有 `cmake -S <dir>` 都指向这份打过 patch 的源码树。
 

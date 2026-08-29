@@ -15,10 +15,9 @@
 // ggml tensors are column-major: element (i0, i1, ...) at i0 + i1*ne0 + ...
 // Usage: test_qvac_ops [cpu|vk|metal]
 //   metal requires -DUSE_METAL and a macOS build linking ggml-metal; it is
-//   the harness hook for the Metal porting procedure (docs/metal-porting.md
-//   in the ggml-audio-patch repo).  With patch 2 as shipped, Metal supports_op
-//   returns false for all ten ops, so every case SKIPs until the integrator
-//   enables gates per docs/metal-porting.md.
+//   the harness for the optional Metal patch (docs/metal-porting.md in the
+//   ggml-audio-patch repo).  With patch 3, the five Supertonic ops and Snake
+//   execute on Metal; the four ops without donor kernels cleanly SKIP.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +34,6 @@ ggml_backend_t             ggml_backend_vk_init(size_t dev_num);
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
 #endif
 #ifdef USE_METAL
-// generic device API: "Metal" device -> buffer type (ggml-backend.h)
 ggml_backend_t ggml_backend_metal_init(void);
 #endif
 
@@ -85,10 +83,9 @@ static void tctx_begin(struct tctx * t) {
 #endif
 #ifdef USE_METAL
     if (strcmp(g_backend, "metal") == 0) {
-        t->backend = ggml_backend_metal_init(0);
-        ggml_backend_dev_t dev = ggml_backend_dev_by_name("Metal");
-        GGML_ASSERT(dev && "USE_METAL build but no Metal device found");
-        t->buft = ggml_backend_dev_buffer_type(dev);
+        t->backend = ggml_backend_metal_init();
+        GGML_ASSERT(t->backend && "USE_METAL build but Metal initialization failed");
+        t->buft = ggml_backend_get_default_buffer_type(t->backend);
         return;
     }
 #endif
@@ -860,6 +857,79 @@ static void test_snake(void) {
     printf("  done (%d failures so far)\n", failures);
 }
 
+#ifdef USE_METAL
+static void test_metal_support_gates(void) {
+    if (strcmp(g_backend, "metal") != 0) {
+        return;
+    }
+
+    printf("[test] metal supports_op gates / fallback envelope\n");
+
+    struct tctx t;
+    tctx_begin(&t);
+
+    struct ggml_tensor * x_tc = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 8, 4);
+    struct ggml_tensor * w    = ggml_new_tensor_3d(t.ctx, GGML_TYPE_F32, 3, 1, 4);
+    struct ggml_tensor * v4a  = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, 4);
+    struct ggml_tensor * v4b  = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, 4);
+    struct ggml_tensor * res  = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 8, 4);
+
+    struct ggml_tensor * depthwise = ggml_supertonic_depthwise_1d(t.ctx, x_tc, w, v4a, 1);
+    CHECK(ggml_backend_supports_op(t.backend, depthwise), "metal depthwise supported envelope rejected");
+    ((int32_t *) depthwise->op_params)[0] = 9;
+    CHECK(!ggml_backend_supports_op(t.backend, depthwise), "metal depthwise K=9 must fall back");
+
+    struct ggml_tensor * layer_norm = ggml_supertonic_layer_norm_channel(t.ctx, x_tc, v4a, v4b, 1e-5f);
+    CHECK(ggml_backend_supports_op(t.backend, layer_norm), "metal layer_norm supported envelope rejected");
+    ((int32_t *) layer_norm->op_params)[1] = 2;
+    CHECK(!ggml_backend_supports_op(t.backend, layer_norm), "metal layer_norm invalid layout must fall back");
+
+    struct ggml_tensor * pw2 = ggml_supertonic_pw2_residual(t.ctx, x_tc, v4a, v4b, res);
+    CHECK(ggml_backend_supports_op(t.backend, pw2), "metal pw2 supported envelope rejected");
+    ((int32_t *) pw2->op_params)[0] = 2;
+    CHECK(!ggml_backend_supports_op(t.backend, pw2), "metal pw2 invalid layout must fall back");
+
+    struct ggml_tensor * bias_gelu = ggml_supertonic_bias_gelu(t.ctx, x_tc, v4a);
+    CHECK(ggml_backend_supports_op(t.backend, bias_gelu), "metal bias_gelu supported envelope rejected");
+    ((int32_t *) bias_gelu->op_params)[0] = 2;
+    CHECK(!ggml_backend_supports_op(t.backend, bias_gelu), "metal bias_gelu invalid layout must fall back");
+
+    struct ggml_tensor * edge_pad = ggml_supertonic_edge_pad_1d(t.ctx, x_tc, 1, 2);
+    CHECK(ggml_backend_supports_op(t.backend, edge_pad), "metal edge_pad supported envelope rejected");
+    ((int32_t *) edge_pad->op_params)[2] = 2;
+    CHECK(!ggml_backend_supports_op(t.backend, edge_pad), "metal edge_pad invalid layout must fall back");
+
+    struct ggml_tensor * snake = ggml_snake(t.ctx, x_tc, v4a, v4b);
+    CHECK(ggml_backend_supports_op(t.backend, snake), "metal snake supported envelope rejected");
+    const enum ggml_type saved_type = v4b->type;
+    v4b->type = GGML_TYPE_F16;
+    CHECK(!ggml_backend_supports_op(t.backend, snake), "metal snake mixed types must fall back");
+    v4b->type = saved_type;
+
+    struct ggml_tensor * whh = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 4, 12);
+    struct ggml_tensor * gi  = ggml_new_tensor_3d(t.ctx, GGML_TYPE_F32, 12, 1, 3);
+    struct ggml_tensor * bhh = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, 12);
+    CHECK(!ggml_backend_supports_op(t.backend, ggml_gru(t.ctx, whh, gi, bhh, false)),
+          "metal GRU must fall back without a kernel");
+
+    CHECK(!ggml_backend_supports_op(t.backend, ggml_zero_upsample(t.ctx, x_tc, 2)),
+          "metal zero_upsample must fall back without a kernel");
+
+    struct ggml_tensor * x4d = ggml_new_tensor_4d(t.ctx, GGML_TYPE_F32, 2, 3, 4, 1);
+    CHECK(!ggml_backend_supports_op(t.backend, ggml_channel_shuffle(t.ctx, x4d, 2)),
+          "metal channel_shuffle must fall back without a kernel");
+
+    struct ggml_tensor * aw    = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 2, 4);
+    struct ggml_tensor * ab    = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 2, 4);
+    struct ggml_tensor * slope = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, 4);
+    CHECK(!ggml_backend_supports_op(t.backend, ggml_affine_prelu(t.ctx, x4d, aw, ab, slope)),
+          "metal affine_prelu must fall back without a kernel");
+
+    tctx_end(&t);
+    printf("  done (%d failures so far)\n", failures);
+}
+#endif
+
 int main(int argc, char ** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 1) {
@@ -877,6 +947,9 @@ int main(int argc, char ** argv) {
     test_channel_shuffle();
     test_affine_prelu();
     test_snake();
+#ifdef USE_METAL
+    test_metal_support_gates();
+#endif
 
     if (failures == 0) {
         printf("\nALL PASSED\n");

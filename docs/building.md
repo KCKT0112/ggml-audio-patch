@@ -22,9 +22,10 @@ cd ggml-src
 git checkout 30bf868                       # v0.19.0
 git apply <path-to>/patches/learned-ops-ggml0190.patch   # patch 1 (required)
 git apply <path-to>/patches/qvac-ops-ggml0190.patch      # patch 2 (optional, sequential)
+git apply <path-to>/patches/metal-ops-ggml0190.patch     # patch 3 (optional Metal integration)
 ```
 
-Patch 2 must be applied **after** patch 1 (they touch the same enum-assert and dispatch hunks). Applying only patch 1 is fine; there is no patch-2-only configuration.
+Patch 2 must be applied **after** patch 1 (they touch the same enum-assert and dispatch hunks), and patch 3 must follow patch 2. Applying only patch 1 is fine; patch 2 and patch 3 cannot be applied independently of their predecessors.
 
 All further `cmake -S <dir>` commands below point at this patched tree.
 

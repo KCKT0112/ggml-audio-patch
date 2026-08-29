@@ -2,7 +2,7 @@
 
 > **[中文文档](README_CN.md)** | English
 
-A curated patch set that ports **fourteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0**, adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA backends. Shipped as two sequential unified diffs plus correctness tests and cross-backend benchmark suites.
+A curated patch set that ports **fourteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0**, adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends. Shipped as three sequential unified diffs plus correctness tests and cross-backend benchmark suites.
 
 ## Patch 1 — the four learned operators
 
@@ -30,7 +30,11 @@ Ported from [tetherto/qvac-ext-ggml](https://github.com/tetherto/qvac-ext-ggml) 
 | `GGML_OP_AFFINE_PRELU` | LavaSR denoiser | per-channel affine + PReLU in one pass. |
 | `GGML_OP_SNAKE` | ACE-Step Oobleck VAE | snake activation `y = x + sin²(a·x)·inv_b` with per-channel params. |
 
-Supertonic ops are CPU-only here (upstream qvac ships them as Metal kernels; a Metal port is future work). `GRU` / `ZERO_UPSAMPLE` / `CHANNEL_SHUFFLE` / `AFFINE_PRELU` / `SNAKE` also have Vulkan compute-shader implementations; `GRU` additionally has register-resident small-H variants (H = 2/4/8) and caps at H ≤ 128 (shared-memory).
+## Patch 3 — verified Metal integration
+
+Applies **on top of patch 2**. It wires the five Supertonic kernels and direct `GGML_OP_SNAKE` dispatch into Metal, with strict F32/shape/parameter gates. `GRU` / `ZERO_UPSAMPLE` / `CHANNEL_SHUFFLE` / `AFFINE_PRELU` remain clean CPU fallbacks because the donor has no Metal kernels for them. See [docs/metal-porting.md](docs/metal-porting.md) for the verification matrix and platform evidence.
+
+`GRU` / `ZERO_UPSAMPLE` / `CHANNEL_SHUFFLE` / `AFFINE_PRELU` / `SNAKE` also have Vulkan compute-shader implementations; `GRU` additionally has register-resident small-H variants (H = 2/4/8) and caps at H ≤ 128 (shared-memory).
 
 Base tree: ggml [`30bf868`](https://github.com/ggml-org/ggml) (v0.19.0). The diffs are additive at enum/builder/kernel insertion points, so applying onto nearby commits usually needs only light conflict resolution.
 
@@ -40,13 +44,14 @@ Base tree: ggml [`30bf868`](https://github.com/ggml-org/ggml) (v0.19.0). The dif
 ggml-audio-patch/
 ├── patches/
 │   ├── learned-ops-ggml0190.patch   # unified diff against ggml v0.19.0 (patch 1)
-│   └── qvac-ops-ggml0190.patch      # unified diff on top of patch 1 (patch 2)
+│   ├── qvac-ops-ggml0190.patch      # unified diff on top of patch 1 (patch 2)
+│   └── metal-ops-ggml0190.patch     # Metal integration on top of patch 2 (patch 3)
 ├── tests/
 │   ├── test_learned_ops.c           # patch-1 correctness smoke tests (hand-computed references)
 │   ├── test_qvac_ops.c              # patch-2 correctness smoke tests (cpu | vk | metal harness hook)
 │   ├── bench_learned_ops.c          # patch-1 CPU / Vulkan / CUDA micro-benchmarks
-│   └── bench_qvac_ops.c             # patch-2 fused-vs-composed benchmarks (CPU + Vulkan)
-├── metal-reference/                 # upstream-extracted Metal kernels + host glue (NOT wired; see docs/metal-porting.md)
+│   └── bench_qvac_ops.c             # patch-2 fused-vs-composed benchmarks (CPU + Vulkan + Metal)
+├── metal-reference/                 # frozen upstream source used by patch 3 (see docs/metal-porting.md)
 │   ├── supertonic_ops.metal         # 6 kernels verbatim from qvac (MIT), frozen reference
 │   └── host-side.cpp                # kargs structs, pipeline lookup, dispatchers, supports_op gates
 ├── scripts/
@@ -68,13 +73,14 @@ git clone https://github.com/ggml-org/ggml.git ggml-src
 cd ggml-src && git checkout 30bf868        # v0.19.0
 git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch   # patch 1
 git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch      # patch 2 (sequential, on top)
+git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch     # patch 3 (Metal, optional)
 ```
 
-Patch 2 must follow patch 1: they touch the same enum-assert and dispatch hunks. Applying only patch 1 is fine (skip the second line).
+Apply the patches in order. Patch 3 is optional on non-Metal platforms; patch 2 must follow patch 1.
 
 Then configure / build / test — see **[docs/building.md](docs/building.md)** for prerequisites (Vulkan SDK, CUDA toolkit, Windows generator choice) and per-backend commands, or run the bundled `scripts/build-and-test.sh` / `build-and-test.ps1`.
 
-Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path. Patch-2 headline: depthwise-1d fused 19–30× vs `conv_1d_dw`+pad+bias on CPU; snake 2.2–4.6× CPU / up to 3.9× Vulkan; affine_prelu up to 6.3× Vulkan; gru fills the RNN gap at ~47 ms for H512×B4×L32 on CPU.)
+Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path. Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.49× on Apple M4 Metal; Snake reaches 3.90× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.18×.)
 
 ## Backend support matrix
 
@@ -91,18 +97,18 @@ Patch 2:
 
 | Operator | CPU | Vulkan | CUDA | Metal |
 |---|---|---|---|---|
-| `SUPERTONIC_DEPTHWISE_1D` (+`_ct`, `_causal_ct`) | ✅ | — falls back to CPU | — | — |
-| `SUPERTONIC_LAYER_NORM_CHANNEL` (+`_ct`) | ✅ | — | — | — |
-| `SUPERTONIC_PW2_RESIDUAL` (+`_ct`) | ✅ | — | — | — |
-| `SUPERTONIC_BIAS_GELU` (+`_ct`) | ✅ | — | — | — |
-| `SUPERTONIC_EDGE_PAD_1D` (+`_ct`) | ✅ | — | — | — |
+| `SUPERTONIC_DEPTHWISE_1D` (+`_ct`, `_causal_ct`) | ✅ | — falls back to CPU | — | ✅ F32, K ∈ {3,5,7} |
+| `SUPERTONIC_LAYER_NORM_CHANNEL` (+`_ct`) | ✅ | — | — | ✅ F32 |
+| `SUPERTONIC_PW2_RESIDUAL` (+`_ct`) | ✅ | — | — | ✅ F32 |
+| `SUPERTONIC_BIAS_GELU` (+`_ct`) | ✅ | — | — | ✅ F32 |
+| `SUPERTONIC_EDGE_PAD_1D` (+`_ct`) | ✅ | — | — | ✅ F32 |
 | `GRU` | ✅ | ✅ H ≤ 128 (+H=2/4/8 variants) | — | — |
 | `ZERO_UPSAMPLE` | ✅ | ✅ | — | — |
 | `CHANNEL_SHUFFLE` | ✅ | ✅ | — | — |
 | `AFFINE_PRELU` | ✅ | ✅ | — | — |
-| `SNAKE` | ✅ | ✅ | — | — |
+| `SNAKE` | ✅ | ✅ | — | ✅ F32 |
 
-(Upstream qvac implements the supertonic five as Metal kernels; the snake/shuffle/upsample/prelu/gru five as Vulkan shaders. This port keeps the Vulkan five, gates Metal off for all ten pending a verified port — the upstream Metal kernels and host-side glue are preserved in [`metal-reference/`](metal-reference/), with the integration procedure, verification steps, and acceptance criteria in [docs/metal-porting.md](docs/metal-porting.md) — and gates CUDA off, matching upstream, which has no CUDA implementations either. Contribution/editing boundaries for humans and agents: [AGENTS.md](AGENTS.md).)
+(Patch 3 wires the donor's five Supertonic Metal kernels and direct Snake dispatch. The other four qvac ops have no donor Metal kernel and remain explicitly gated off. Frozen sources, integration notes, verification evidence, and acceptance criteria are in [`metal-reference/`](metal-reference/) and [docs/metal-porting.md](docs/metal-porting.md). CUDA remains gated off, matching the donor. Contribution/editing boundaries: [AGENTS.md](AGENTS.md).)
 
 Unsupported parameter combinations are rejected by each backend's `supports_op`, so graphs fall back to the CPU backend cleanly instead of producing wrong results.
 
