@@ -284,3 +284,24 @@ The remaining ~1.5× gap (Vulkan 430–480 ms vs ORT DML EP 281.6 ms — same-se
 - **Precision-preserving tensor-core use** (split-f16/Kahan-style decomposition GEMM) is infrastructure-grade: a numerically-correct matrix-engine + per-vendor extension matrix maintenance, deliberately out of scope, mirroring the cross-ISA maintenance refusal on the CPU side.
 
 So **430–480 ms fp32 with max|Δ| 6.1e-4 against the torch golden (10× tighter than DML) is the shipped terminal state** of the Vulkan path. The experimental knob scaffolding used for the CPU cache-blocking hearing (`GGML_CONV_TSB`/`GGML_CONV_OSB_KB`/`GGML_CONV_ORDER`) never entered any shipped patch — sandbox rebuild from stock v0.19.0 + patch 1 reproduced the headline CPU claim bit-identically (output MD5 match), corr 0.99999999, T24 4 487 ms vs 4 490 ms interleaved A/B on the reference binary.
+
+### Real-machine spike of the f16-HMMA conv route (consumer-driven; NO-GO confirmed)
+
+A follow-up acceptance update (DML-equivalent precision gate: corr/rms/p999 ≥ ORT-DML and max|Δ| ≤ 2× DML) cleared the consumer to actually wire the f16-HMMA route end-to-end.  The spike adds a `PCNSF_BHMMA=1` branch in the consumer's graph builder: every conv with `K >= 3` goes through `cast(w) → f16` + `im2col_fast_1d(src=f32 → dst=f16)` + contiguous B + `ggml_mul_mat(f16 × f16 → f32, coopmat)`; the producer-side fusions are disabled on this path (explicit `+bias / leaky / res` nodes after the GEMM).  It exists only in the consumer's stash ("BHMMA spike"), no shipped patch changed.  Result on the same 20 s clip (RTX 2070, ggml v0.19.0 + patch 4):
+
+| configuration | wall (warm, n=7 after first) | corr vs CPU golden | max|Δ| | rms |
+|---|---|---|---|---|---|
+| **B-HMMA spike** | **1 294.1 ms** | **0.9999902022** | **1.365e-02** | 2.73e-04 |
+| stock fp32 direct conv | 433–480 ms | 0.9999998460 | 6.13e-04 | 3.43e-05 |
+| ORT DML EP | ~282 ms | 0.9999969745 | 2.09e-03 | 1.52e-04 |
+| B-sim (torch half-rounded conv operands) | n/a | 0.9999996909 | 3.94e-03 | 4.92e-05 |
+
+The end-to-end B path is **2.7× slower** than the shipped fp32 direct conv (4.6× slower than DML), and its precision is **~7× below DML** (corr drops a digit; max|Δ| grows ~7× over DML).  Decomposition (per-op profile + `bench_mm_vk`):
+
+- **f16 im2col is a stock slow kernel**: the learned-ops patch optimizes only the f32-destination epilogue/tiling of `IM2COL_FAST_1D`; a f16 dst falls through to ggml's generic IM2COL shader ≈ 49.9 ms/conv average.
+- **f16 MUL_MAT refuses the coopmat fast path on graph-produced layouts**: `reshape(im2col)` doesn't satisfy the stride/alignment the `mul_mm_cm2`/`mul_mm` fp16 shaders require, so the dispatch falls to a generic scalar kernel ≈ 39.9 ms/conv in-graph; a clean contiguous f16 GEMM at the same geometry runs in 1.18 ms isolation, a 34× in-graph penalty.
+- **`K = 1` / `OC = 1` convs have no HMMA route at all**: ggml-vulkan MUL_MAT on a 1-column output falls to matvec-scalar (≈ 900 ms for an 881 664-sample GEMV); our guard kicks these back to fp32 direct conv.
+- **Fusion loss**: producer-side fusions (leaky/scale/residual folding) disappear on the B path — the graph grows ~4 explicit elementwise kernels per conv (~200 extra nodes total), each paying the Vulkan per-op submission tax.
+- **Theoretical-vs-real precision gap**: the B-sim corr 0.9999996909 assumed `torch.half(x) → fp32 conv` on the torch model; the real chain additionally routes activations through `OpFConvert` inside an im2col shader, packs them into f16 buffers, and feeds an HMMA kernel whose microkernel ordering and tail/padding handling differ.  The pipeline-noise hypothesis (~1.5e-3 max|Δ| per-EP floor) fails to absorb the extra ~8× gap; the error has a fingerprint orthogonal to the EP-noise directions (cross-error correlation ≤ 0.05 against every legal backend).
+
+So the B-vs-E distinction collapses: **a working f16-HMMA path requires the same kernel-engineering surface as the rejected "E" (vendor-specific HMMA pipeline)** — an f16-aware IM2COL variant, in-graph f16 MUL_MAT layout relaxation, an OC=1-safe HMMA route, and re-fused producer epilogues.  All of which is exactly what was ruled out as infra-grade.  The terminal state stands.

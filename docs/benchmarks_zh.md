@@ -284,3 +284,26 @@ python cmp_align.py vulkan_out.f32   rem 与 torch-CPU golden 做 offset 对齐 
 - **保精度的张量核利用**（split-f16/Kahan 式分解 GEMM）：属基建级——一个数值正确的矩阵引擎 + 按厂商矩阵扩展的长期维护，刻意不做，与 CPU 侧跨 ISA 维护的拒绝同构。
 
 故 **fp32 430–480 ms、对 torch golden max|Δ| 6.1e-4（比 DML 紧 10×）即为 Vulkan 路径的发货终态**。CPU cache-blocking 听证用过的实验旋钮脚手架（`GGML_CONV_TSB`/`GGML_CONV_OSB_KB`/`GGML_CONV_ORDER`）从未进入任何发货 patch——从 stock v0.19.0 + 补丁一的 sandbox 重建逐位复现了 CPU 头条主张（输出 MD5 一致）、corr 0.99999999、与参考二进制交错 A/B 的 T24 为 4 487 ms 对 4 490 ms。
+
+### f16-HMMA conv 路径的真机 spike(下游驱动;NO-GO 确认)
+
+承接上文精度听证之后的验收更新(合同放宽为 **DML 等价:corr/rms/p999 ≥ ORT-DML 且 max|Δ| ≤ 2× DML** 后,用户批准直接做 B 路径实证 spike,不再绕开这个此前因"大动干戈"跳过的方案)。
+
+下游 pc-nsf-hifigan.cpp 以 `PCNSF_BHMMA=1` 环境分支实现了 B 路线:全部 K>1 conv 改 `cast(w→f16)` + `im2col_fast_1d(src1=f32→dst=f16)` + contiguous B 矩阵 + `ggml_mul_mat(f16×f16→f32, coopmat)`,融合 epilogue 拆为显式 bias/leaky/residual;K=1 / OC=1 守卫返回 fp32。真机结论(RTX 2070 · ggml v0.19.0+patch4 · 881 664 采样):
+
+| 路径 | 暖机 wall(n=7 去首帧) | corr(vs CPU golden) | max\|Δ\| |
+|---|---|---|---|
+| ORT DML EP | ~282 ms | 0.9999969745 | 2.09e-03 |
+| fp32 direct conv(主线终态) | 433–480 ms | 0.9999998460 | 6.13e-04 |
+| **B-HMMA spike** | **1 294.1 ms** | **0.9999902022** | **1.365e-02** |
+
+即 B 在真机上 **2.7× 慢于 fp32 直连、4.6× 慢于 DML**,且 corr 比 DML 低一位、max|Δ| ~7× —— DML 等价合同下双重否决。
+
+失败定位(per-node profile,9 053.5 ms / 1 185 节点):
+
+- `IM2COL_FAST_1D` f16-dst n=97 均 49.9 ms —— 补丁只优化了 f32-dst,f16-dst 落回通用 kernel;
+- `MUL_MAT` f16 n=98 均 39.9 ms —— reshape(im2col) 布局不满足 mul_mm 快路径 stride/对齐要求,落回通用标量 kernel(同几何干净 contiguous 输入微基准 1.18 ms,图内惩罚 34×);
+- conv_post(K=1 / OC=1)单发 matvec-scalar 881 ms;
+- 显式 ADD(n=154,92.3 ms)/CPY(n=196,78.1 ms)额外开销。
+
+由此 **B/E 边界在真机上坍缩**:要让 B 达到微基准投影(约 183 ms),必须补齐 f16-dst im2col 专用 kernel、放宽 MUL_MAT 的输入布局限制、做 OC=1 安全的 HMMA 路径并重融合 producer epilogue —— 这正是此前按"基础设施级工程"否决的 E 的全部内容。**终态维持 fp32 direct conv 不变。**
