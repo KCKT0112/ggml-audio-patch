@@ -2,7 +2,7 @@
 
 > **[中文文档](README_CN.md)** | English
 
-A curated patch set that ports **sixteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0** — fourteen adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends; plus two authored here for the NSF-HiFiGAN vocoder (a fused bias-add + leaky-ReLU, and a stride-1 direct 1-D convolution with producer-side fusions). Shipped as four unified diffs (applied in sequence; the Metal one is platform-optional) plus correctness tests and cross-backend benchmark suites.
+A curated patch set that ports **sixteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0** — fourteen adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends; plus two authored here for the NSF-HiFiGAN vocoder (a fused bias-add + leaky-ReLU, and a stride-1 direct 1-D convolution with producer-side fusions). Shipped as five unified diffs (applied in sequence; the Metal one is platform-optional, the last one is a Vulkan pipeline-cache enhancement with no operator content) plus correctness tests and cross-backend benchmark suites.
 
 ## Patch 1 — the six learned operators
 
@@ -48,6 +48,15 @@ Applies **on top of patches 1 and 2** (patch 2 occupies the same shader-registry
 
 Measured on the full NSF-HiFiGAN vocoder (RTX 2070, driver 32.0.12.x-class, fp32 throughout, `GGML_VK_DISABLE_COOPMAT2=1` so tensor cores stay off; median of repeated runs of the pc-nsf-hifigan.cpp `hifigan_cli` on the reference clip): **≈ 433–479 ms end-to-end** vs. 326 ms for ONNX Runtime's DML EP and 5 155 ms for its CPU EP on the same box. Accuracy against the torch-CPU reference: corr 0.99999985, max|Δ| 6.1e-4 — an order of magnitude tighter than ORT-DML on the same clip (corr 0.99999697, max|Δ| 2.1e-3). Full numbers and repro commands in [docs/benchmarks.md](docs/benchmarks.md#patch-4-vulkan-conv_direct_1d).
 
+## Patch 5 — Vulkan persistent disk pipeline cache
+
+Ports [KakaruHayate/game.cpp](https://github.com/KakaruHayate/game.cpp) (`cmake/patches/ggml-vulkan-pipeline-cache`) onto ggml **v0.19.0**: a per-process `VkPipelineCache` that is loaded from disk at device init, fed to every `vkCreateComputePipelines`, and flushed back when pipelines were created or destroyed. No operator/shader content — numerics are untouched by construction.
+
+- Verified to apply standalone on stock v0.19.0 **and** on top of patches 1–4 (patches 4 and 5 both edit `src/ggml-vulkan/ggml-vulkan.cpp`; recommended order is 1 → 2 → (3) → 4 → 5).
+- env knobs: `GGML_VK_PIPELINE_CACHE_PATH` (override file location; default `ggml_audio_vk_pipeline.cache` under `%LOCALAPPDATA%` on Windows, `$HOME/.cache` on Linux), `GGML_VK_DISABLE_PIPELINE_CACHE=1` (opt out), `GGML_VK_PIPELINE_CACHE_DEBUG=1` (log load/save byte counts).
+- Measured (2026-08-30, Windows 11, Xeon E5-2675 v3, RTX 2070 driver 32.0.16.2002, MSVC 14.29, pc-nsf-hifigan.cpp `hifigan_cli`, reference clip T=1722, blob = 334 150 B): with the cache blob absent the first run of the patched binary pays pipeline compilation **inside** the first compute — 1 061.5 ms in-graph / 2 454 ms process wall; subsequent process restarts with the warm blob run 346.8–355.0 ms in-graph / ≈1 120–1 290 ms wall. First-run cost reduced ≈3× in-graph, ≈2× wall.
+- Honesty note: on this test box the NVIDIA driver's own shader cache (…/NVIDIA/GLCache) also persists compiled pipelines across process restarts, and with that cache hot the blob adds nothing measurable in steady state (interleaved ON/OFF medians 374.0 vs 373.1 ms, n=3, machine scatter ±10%). The blob's value shows when the driver cache is cold or evicted — first run after a driver update/reinstall or cache cleanup, capped-cache configurations, and drivers/platforms with weaker caching. Repro commands and the full run table in [docs/benchmarks.md](docs/benchmarks.md#patch-5-vulkan-pipeline-cache).
+
 Base tree: ggml [`30bf868`](https://github.com/ggml-org/ggml) (v0.19.0). The diffs are additive at enum/builder/kernel insertion points, so applying onto nearby commits usually needs only light conflict resolution.
 
 ## Repository layout
@@ -58,7 +67,8 @@ ggml-audio-patch/
 │   ├── learned-ops-ggml0190.patch   # unified diff against ggml v0.19.0 (patch 1)
 │   ├── qvac-ops-ggml0190.patch      # unified diff on top of patch 1 (patch 2)
 │   ├── metal-ops-ggml0190.patch     # Metal integration on top of patch 2 (patch 3)
-│   └── vulkan-conv-direct-1d-ggml0190.patch  # Vulkan backend for CONV_DIRECT_1D (patch 4, on top of 1+2)
+│   ├── vulkan-conv-direct-1d-ggml0190.patch  # Vulkan backend for CONV_DIRECT_1D (patch 4, on top of 1+2)
+│   └── vulkan-pipeline-cache-ggml0190.patch  # Vulkan persistent disk pipeline cache (patch 5, standalone or on top of 1–4)
 ├── tests/
 │   ├── test_learned_ops.c           # patch-1 correctness smoke tests (hand-computed references)
 │   ├── test_qvac_ops.c              # patch-2 correctness smoke tests (cpu | vk | metal harness hook)
@@ -86,13 +96,14 @@ git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch            # pa
 git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch               # patch 2 (sequential, on top)
 git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch              # patch 3 (Metal, optional)
 git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # patch 4 (on top of 1+2)
+git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # patch 5 (last; also applies standalone on stock v0.19.0)
 ```
 
-Patch 2 must follow patch 1: they touch the same enum-assert and dispatch hunks. Patch 3 is optional on non-Metal platforms. Patch 4 must follow patches 1 and 2: it consumes `CONV_DIRECT_1D` from patch 1 and shares shader-registry/dispatch insertion points with patch 2 (it is orthogonal to patch 3 — apply it with or without the Metal patch). Applying only patch 1 is fine (skip the rest); applying only 1+4 is **not** supported.
+Patch 2 must follow patch 1: they touch the same enum-assert and dispatch hunks. Patch 3 is optional on non-Metal platforms. Patch 4 must follow patches 1 and 2: it consumes `CONV_DIRECT_1D` from patch 1 and shares shader-registry/dispatch insertion points with patch 2 (it is orthogonal to patch 3 — apply it with or without the Metal patch). Patch 5 was verified both standalone on stock v0.19.0 and on top of patches 1–4 — when combined, apply it **last** (it and patch 4 both edit `src/ggml-vulkan/ggml-vulkan.cpp`). Applying only patch 1 is fine (skip the rest); applying only 1+4 is **not** supported.
 
 Then configure / build / test — see **[docs/building.md](docs/building.md)** for prerequisites (Vulkan SDK, CUDA toolkit, Windows generator choice) and per-backend commands, or run the bundled `scripts/build-and-test.sh` / `build-and-test.ps1`.
 
-Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path; 2.50× for `CONV_DIRECT_1D`+fusions on the full NSF-HiFiGAN vocoder (11 089 → 4 431 ms, 24 threads on a 16C/32T Xeon E5-2675 v3 — ahead of the ONNX Runtime CPU EP's 4 724 ms fp32 measured the same day, 2026-08-30 AM). Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.80× on Apple M4 Metal; Snake reaches 3.05× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.24×; affine_prelu up to 6.3× Vulkan; gru fills the RNN gap at ~47 ms for H512×B4×L32 on CPU. Patch-4 headline: the direct conv's Vulkan backend runs the vocoder end-to-end in ≈ 430–480 ms fp32 (vs ORT DML EP 282 ms measured the same day), with 10× tighter fp32 agreement than DML (max|Δ| 6.1e-4 vs 2.1e-3). **Terminal note (2026-08-30):** closing the remaining Vulkan-vs-DML gap was investigated and deliberately stopped — the only route (f16 tensor-core GEMM) measurably degrades precision below the DML anchor (corr 0.99999969 vs DML 0.99999697, max|Δ| 3.9e-3 vs DML 2.1e-3, torch-side simulation), and precision-safe alternatives top out above DML; details in `docs/benchmarks.md` §6.)
+Benchmarks: see **[docs/benchmarks.md](docs/benchmarks.md)** (patch-1 headline: 1.03–1.15× CPU speedup for `IM2COL_FAST_1D` on large frames; 2.15× on Vulkan for the grouped-convT-capable kernel vs. the legacy im2col path; 2.50× for `CONV_DIRECT_1D`+fusions on the full NSF-HiFiGAN vocoder (11 089 → 4 431 ms, 24 threads on a 16C/32T Xeon E5-2675 v3 — ahead of the ONNX Runtime CPU EP's 4 724 ms fp32 measured the same day, 2026-08-30 AM). Patch-2/3 headline: depthwise-1d fused 19–30× on CPU and up to 5.80× on Apple M4 Metal; Snake reaches 3.05× on Metal and 3.9× on Vulkan; Metal channel layer norm reaches 3.24×; affine_prelu up to 6.3× Vulkan; gru fills the RNN gap at ~47 ms for H512×B4×L32 on CPU. Patch-4 headline: the direct conv's Vulkan backend runs the vocoder end-to-end in ≈ 430–480 ms fp32 (vs ORT DML EP 282 ms measured the same day), with 10× tighter fp32 agreement than DML (max|Δ| 6.1e-4 vs 2.1e-3). Patch-5 headline: the Vulkan pipeline cache cuts first-run pipeline-compile cost ≈3× in-graph (1 061.5 → ≈350 ms) and ≈2× process wall (2 454 → ≈1 200 ms) on driver-cache-cold startups, at zero numerics cost. **Terminal note (2026-08-30):** closing the remaining Vulkan-vs-DML gap was investigated and deliberately stopped — the only route (f16 tensor-core GEMM) measurably degrades precision below the DML anchor (corr 0.99999969 vs DML 0.99999697, max|Δ| 3.9e-3 vs DML 2.1e-3, torch-side simulation), and precision-safe alternatives top out above DML; details in `docs/benchmarks.md` §6.)
 
 ## Backend support matrix
 

@@ -332,3 +332,30 @@ python cmp_align.py vulkan_out.f32   rem 与 torch-CPU golden 做 offset 对齐 
 3. B 方案的 f16 舍入仿真 corr/rms/p99.9 落在带内,但 max|Δ|=3.94e-03(带顶 1.88×),且误差方向与 EP 族正交(互相关 ≤0.05,投影 R²=0.0023,谱峰度 19.9–21.7 dB 对合法成员 27.4–39.4 dB):属方向偏离的系统性误差而非更脏的 EP 噪声 —— 与上文真机 NO-GO 结论一致。
 
 测量环境:RTX 2070 / Xeon E5-2675 v3,MSVC 2019 14.29,ggml v0.19.0 + 全部四个补丁;每候选单次确定性前向;原始向量与完整审计表留存下游私有工作目录。
+
+# 补丁五 —— Vulkan 管线持久缓存(声码器启动项;2026-08-30 晚间实测)
+
+环境:Windows 11,Xeon E5-2675 v3(16C/32T),RTX 2070 驱动 32.0.16.2002,MSVC 2019 14.29(`/O2 /Ob2 /DNDEBUG`),Vulkan SDK 1.4.350.0;ggml v0.19.0 + 补丁 1–5(下游 `5c23b2d` + 补丁五接线;ggml worktree `b899edd`);`pc-nsf-hifigan.cpp/build-vk` Release;参考片段 T=1722(881 664 采样);`PCNSF_TIMING=1`,wall 为整进程秒表计时。缓存 blob 路径:`%LOCALAPPDATA%\ggml_audio_vk_pipeline.cache`(334 150 B,首次运行写出)。
+
+| 运行 | blob 状态 | wall (ms) | `hifigan_run` (ms) |
+|---|---|---:|---:|
+| 冷(删 blob) | 无 → 写出 | 2 454 | 1 061.5 |
+| 热 #1 | 载入 334 150 B | 1 146 | 352.2 |
+| `GGML_VK_DISABLE_PIPELINE_CACHE=1` #1 | 存在,未用 | 1 139 | 351.5 |
+| 热 #2 | 载入 | 1 186 | 355.0 |
+| 禁用 #2 | 存在,未用 | 1 190 | 347.5 |
+| 热 #3 | 载入 | 1 120 | 346.8 |
+| 禁用 #3 | 存在,未用 | 1 122 | 355.3 |
+
+独立交叉复测(同二进制,数分钟后,各 n=3):ON —— 430.3 / 376.1 / 374.0 ms;OFF —— 375.1 / 373.1 / 372.4 ms(序列首跑常携带流水线/驱动残余状态;中位数 ON 376.1 对 OFF 373.1 —— 稳态无差异)。
+
+精度门(两份原始输出对 torch-CPU golden,offset 对齐):corr 0.99999985,max|Δ| 6.1314e-04,与存档的无缓存 Vulkan 锚点完全一致 —— 对数值零影响。
+
+**如实解读:**
+
+1. **blob 吸收首跑编译成本。** 无缓存数据时,管线编译发生在第一次图计算内(1 061.5 ms 图内,2 454 ms wall);此后每个带 blob 的进程重启直接以 ≈350 ms 起跑 —— 对本模型 60+ 条管线的"驱动缓存冷启动"场景,图内 ≈3×、wall ≈2× 改善。
+2. **本机的 NVIDIA 驱动自身 shader 缓存(`…/NVIDIA/GLCache`)同样跨进程保存编译产物。** 该层命中时,ON/OFF 稳态在统计上无差别(见上表)。因此 blob 主要买的是"驱动缓存冷/被逐出"场景的稳健性:驱动升级/重装后的首跑、缓存容量受限的驱动、缓存清理后,以及缓存能力弱或被关闭的驱动/平台。
+3. **本机时序确有漂移**:同一晚同二进制的各测量序列出现 ≈350 / ≈375 / ≈430 ms 三簇(±10%)。以上数字按序列原样成对记录(wall + 图内),请勿引用单次值。
+4. 构造"驱动缓存冷"受控 A/B 的尝试未获干净结果:清空 `NVIDIA/DXCache`(2 286 个文件,10.2 GB)已确认清空;持有本应用编译产物的 `NVIDIA/GLCache`(80 文件 / 38 MB,含 16:52 会话写入的 5.6 MB 一对)在一次列表时还在、下一次列表时已消失,**期间并无显式删除**(驱动/服务自管理),且稳态时序并未回落至首跑水平,反而逐跑散布扩大到 ±90 ms。因此除首表第一行的真实首跑外,不宣称任何"驱动冷"数值。
+
+复现(在下游工作目录):`Remove-Item $env:LOCALAPPDATA\ggml_audio_vk_pipeline.cache; $env:GGML_VK_PIPELINE_CACHE_DEBUG=1; $env:PCNSF_TIMING=1; hifigan_cli.exe hifigan_f32.gguf mel.bin f0.bin out.wav`,之后不删 blob 直接重跑;稳态 A/B 用 `$env:GGML_VK_DISABLE_PIPELINE_CACHE=1`。

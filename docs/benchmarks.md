@@ -330,3 +330,30 @@ Three conclusions:
 3. The f16-rounding simulation of route B lands corr/rms/p99.9 inside the band but max|Δ| = 3.94e-03 (1.88× the band top), with an error direction orthogonal to the EP family (xcorr ≤0.05, projection R²=0.0023, spectral peakiness 19.9–21.7 dB vs 27.4–39.4 dB for legitimate members): a systematic off-direction error, not louder EP noise — consistent with the real-machine NO-GO above.
 
 Measured on RTX 2070 / Xeon E5-2675 v3, MSVC 2019 14.29, ggml v0.19.0 + all four patches; single deterministic forward pass per candidate; raw vectors and the full audit table kept in the consumer's private work directory.
+
+# Patch 5 — Vulkan pipeline cache (vocoder startup; measured 2026-08-30 evening)
+
+Environment: Windows 11, Xeon E5-2675 v3 (16C/32T), RTX 2070 driver 32.0.16.2002, MSVC 2019 14.29 (`/O2 /Ob2 /DNDEBUG`), Vulkan SDK 1.4.350.0; ggml v0.19.0 + patches 1–5 (consumer at `5c23b2d` + patch-5 wiring; ggml worktree `b899edd`); `pc-nsf-hifigan.cpp/build-vk` Release; reference clip T=1722 (881 664 samples); `PCNSF_TIMING=1`, wall measured by process stopwatch around the full CLI. Cache blob path: `%LOCALAPPDATA%\ggml_audio_vk_pipeline.cache` (334 150 B, written on the first run).
+
+| run | blob state | wall (ms) | `hifigan_run` (ms) |
+|---|---|---|---:|---:|
+| cold (blob deleted) | absent → written | 2 454 | 1 061.5 |
+| warm #1 | loaded 334 150 B | 1 146 | 352.2 |
+| `GGML_VK_DISABLE_PIPELINE_CACHE=1` #1 | present, unused | 1 139 | 351.5 |
+| warm #2 | loaded | 1 186 | 355.0 |
+| disabled #2 | present, unused | 1 190 | 347.5 |
+| warm #3 | loaded | 1 120 | 346.8 |
+| disabled #3 | present, unused | 1 122 | 355.3 |
+
+Independent interleaved confirmation (same binaries, minutes later, n=3 each): ON — 430.3 / 376.1 / 374.0 ms; OFF — 375.1 / 373.1 / 372.4 ms (first ON run of a sequence typically pays leftover pipeline/driver state, median ON 376.1 vs OFF 373.1 — no steady-state difference).
+
+Precision gate (both raw outputs vs torch-CPU golden, offset-aligned): corr 0.99999985, max|Δ| 6.1314e-04, identical to the archived no-cache Vulkan anchor — no numerics impact.
+
+**Honest reading:**
+
+1. **The blob absorbs the first-run compile cost.** With no cached data, pipeline compilation happens inside the first graph compute (1 061.5 ms in-graph, 2 454 ms wall). Every later process with the blob present starts at ≈350 ms — an ≈3× in-graph, ≈2× wall improvement for driver-cache-cold startups of this model's 60+ pipelines.
+2. **On this box the NVIDIA driver's own shader cache (`…/NVIDIA/GLCache`) also caches compiled pipelines.** With that layer hot, ON and OFF steady-state are statistically identical (see tables). The blob therefore mainly buys robustness where the driver cache is cold or evicted: first run after a driver update/reinstall, cache-size-capped drivers, cache cleanup, and drivers/platforms with weak or disabled caching.
+3. **Machine scatter is real on this box**: across same-binary sequences on the same evening we observed timing clusters at ≈350/≈375/≈430 ms (±10%). All numbers above are reported per-sequence with wall + in-graph pairs; do not quote single runs.
+4. Attempts to force a controlled driver-cache-cold A/B were inconclusive: wiping `NVIDIA/DXCache` (2 286 files, 10.2 GB) was confirmed empty afterwards; the `NVIDIA/GLCache` entries holding this app's compiled shaders (80 files / 38 MB, incl. a 5.6 MB pair written during the first sequence) were present in one listing and gone at the next **without an intervening explicit wipe** (driver/service self-management), while steady-state timings did not reset to the cold-run level but per-run scatter grew to ±90 ms. We therefore claim a driver-cold benefit only from the genuine first-run observation (row 1 of the first table).
+
+Repro (from the consumer work directory): `Remove-Item $env:LOCALAPPDATA\ggml_audio_vk_pipeline.cache; $env:GGML_VK_PIPELINE_CACHE_DEBUG=1; $env:PCNSF_TIMING=1; hifigan_cli.exe hifigan_f32.gguf mel.bin f0.bin out.wav` then rerun without deleting the blob; A/B steady-state with `$env:GGML_VK_DISABLE_PIPELINE_CACHE=1`.

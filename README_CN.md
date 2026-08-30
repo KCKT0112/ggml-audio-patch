@@ -2,7 +2,7 @@
 
 > 中文 | **[English](README.md)**
 
-一套精选补丁，把**十六个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：十四个取自 ggml 生态不同项目——API 对齐上游规范、修复原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持；另有两个为 NSF-HiFiGAN 声码器在本仓库新写（融合 bias 加 + leaky ReLU；带生产侧融合的 stride-1 直接 1D 卷积）。以四个统一 diff 交付（按序应用，Metal 补丁可按平台跳过），另附正确性测试与跨后端基准程序。
+一套精选补丁，把**十六个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：十四个取自 ggml 生态不同项目——API 对齐上游规范、修复原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持；另有两个为 NSF-HiFiGAN 声码器在本仓库新写（融合 bias 加 + leaky ReLU；带生产侧融合的 stride-1 直接 1D 卷积）。以五个统一 diff 交付（按序应用，Metal 补丁可按平台跳过；最后一个是不含算子内容的 Vulkan 管线缓存增强），另附正确性测试与跨后端基准程序。
 
 ## 补丁一：六个 learned 算子
 
@@ -48,6 +48,15 @@
 
 全 NSF-HiFiGAN 声码器实测（RTX 2070，32.0.12.x 级驱动，全程 fp32，`GGML_VK_DISABLE_COOPMAT2=1` 关闭张量核；pc-nsf-hifigan.cpp `hifigan_cli` 参考音频多次运行取中位）：**端到端约 433–479 ms**，对比同机 ONNX Runtime DML EP 326 ms / CPU EP 5 155 ms。对 torch-CPU 参考的精度：corr 0.99999985、max|Δ| 6.1e-4——比同片 ORT-DML 紧一个数量级（corr 0.99999697、max|Δ| 2.1e-3）。完整数据与复现命令见 [docs/benchmarks_zh.md](docs/benchmarks_zh.md#补丁四vulkan-conv_direct_1d)。
 
+## 补丁五：Vulkan 持久化磁盘管线缓存
+
+移植自 [KakaruHayate/game.cpp](https://github.com/KakaruHayate/game.cpp)（`cmake/patches/ggml-vulkan-pipeline-cache`），适配 ggml **v0.19.0**：每进程一个 `VkPipelineCache`，设备初始化时从磁盘载入，喂给每次 `vkCreateComputePipelines`，在管线被创建/销毁后回写磁盘。不含任何算子/shader 内容——数值上按构造零影响。
+
+- 已验证在原生 v0.19.0 上**独立可用**，同时可叠加在补丁 1–4 之上（补丁四、五都改 `src/ggml-vulkan/ggml-vulkan.cpp`；推荐顺序 1 → 2 →（3）→ 4 → 5）。
+- 环境开关：`GGML_VK_PIPELINE_CACHE_PATH`（自定义缓存文件位置；默认 `ggml_audio_vk_pipeline.cache`，Windows 下位于 `%LOCALAPPDATA%`，Linux 下位于 `$HOME/.cache`）、`GGML_VK_DISABLE_PIPELINE_CACHE=1`（关闭）、`GGML_VK_PIPELINE_CACHE_DEBUG=1`（打印载入/写回字节数）。
+- 实测（2026-08-30，Windows 11，Xeon E5-2675 v3，RTX 2070 驱动 32.0.16.2002，MSVC 14.29，pc-nsf-hifigan.cpp `hifigan_cli`，参考片段 T=1722，blob 334 150 B）：无 blob 时新补丁二进制的首跑会把管线编译计进第一次计算——图内 1 061.5 ms / 进程 wall 2 454 ms；此后带 blob 的进程重启稳定在图内 346.8–355.0 ms / wall ≈1 120–1 290 ms。首跑成本图内 ≈3×、wall ≈2× 缩减。
+- 如实说明：本测试机上 NVIDIA 驱动自身的 shader 缓存（…/NVIDIA/GLCache）同样跨进程保存编译产物；该层命中时，blob 在稳态没有可测增益（交叉实测中位数 ON 376.1 对 OFF 373.1 ms，n=3，机器散布 ±10%）。blob 的价值体现在驱动缓存冷/被逐出时——驱动升级/重装或缓存清理后的首跑、缓存容量受限的配置、缓存能力弱的驱动/平台。复现命令与完整运行表见 [docs/benchmarks_zh.md](docs/benchmarks_zh.md#补丁五--vulkan-管线持久缓存)。
+
 基线：ggml [`30bf868`](https://github.com/ggml-org/ggml)（v0.19.0）。diff 只在枚举/builder/kernel 的插入点上做增量，应用到邻近 commit 通常只需少量冲突处理。
 
 ## 目录结构
@@ -58,7 +67,8 @@ ggml-audio-patch/
 │   ├── learned-ops-ggml0190.patch   # 基于 ggml v0.19.0 的统一 diff（补丁一）
 │   ├── qvac-ops-ggml0190.patch      # 叠加在补丁一之上的统一 diff（补丁二）
 │   ├── metal-ops-ggml0190.patch     # 叠加在补丁二之上的 Metal 集成（补丁三）
-│   └── vulkan-conv-direct-1d-ggml0190.patch  # CONV_DIRECT_1D 的 Vulkan 后端（补丁四，叠加于一+二）
+│   ├── vulkan-conv-direct-1d-ggml0190.patch  # CONV_DIRECT_1D 的 Vulkan 后端（补丁四，叠加于一+二）
+│   └── vulkan-pipeline-cache-ggml0190.patch  # Vulkan 持久化磁盘管线缓存（补丁五，可独立或叠加于一至四）
 ├── tests/
 │   ├── test_learned_ops.c           # 补丁一正确性冒烟测试（手写参考值对照）
 │   ├── test_qvac_ops.c              # 补丁二正确性测试（cpu | vk | metal 挂具钩子）
@@ -86,13 +96,14 @@ git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch            # �
 git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch               # 补丁二（顺序应用）
 git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch              # 补丁三（Metal，可选）
 git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # 补丁四（叠加于一+二）
+git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # 补丁五（最后应用；也可独立应用于原生 v0.19.0）
 ```
 
-补丁二必须跟在补丁一之后：两者触碰相同的枚举断言与分发代码块。非 Metal 平台可不应用补丁三。补丁四必须跟在补丁一、二之后：它消费补丁一的 `CONV_DIRECT_1D`，并与补丁二共用 shader 注册表/分发插入点（与补丁三正交——无论装不装 Metal 补丁都可同样应用）。只装补丁一可以（跳过后续）；只装一+四**不支持**。
+补丁二必须跟在补丁一之后：两者触碰相同的枚举断言与分发代码块。非 Metal 平台可不应用补丁三。补丁四必须跟在补丁一、二之后：它消费补丁一的 `CONV_DIRECT_1D`，并与补丁二共用 shader 注册表/分发插入点（与补丁三正交——无论装不装 Metal 补丁都可同样应用）。补丁五已验证既可独立应用于原生 v0.19.0，也可叠加在补丁 1–4 之上——组合应用时**最后装**（它与补丁四都改 `src/ggml-vulkan/ggml-vulkan.cpp`）。只装补丁一可以（跳过后续）；只装一+四**不支持**。
 
 配置 / 编译 / 测试见 **[docs/building_zh.md](docs/building_zh.md)**（含 Vulkan SDK、CUDA 工具链、Windows 生成器选择等注意事项），或直接跑 `scripts/build-and-test.sh` / `build-and-test.ps1`。
 
-性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×；`CONV_DIRECT_1D`+融合在全 NSF-HiFiGAN 声码器上 2.50×（11 089 → 4 431 ms，16C/32T Xeon E5-2675 v3、24 线程——快于 2026-08-30 当日实测的 ONNX Runtime CPU EP 4 724 ms fp32）。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.80×；Snake 在 Metal 达 3.05×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.24×；affine_prelu Vulkan 最高 6.3×；gru 补上 RNN 空缺，CPU H512×B4×L32 约 47 ms。补丁四要点：同一直接卷积的 Vulkan 后端以 fp32 跑完整声码器约 430–480 ms（对当日实测 ORT DML EP 282 ms），fp32 一致性比 DML 紧一个数量级（max|Δ| 6.1e-4 对 2.1e-3）。**终态说明（2026-08-30）**：追平 Vulkan 与 DML 剩余差距的路径已勘察并刻意止步——唯一可能路线（f16 张量核 GEMM）经 torch 侧模拟精度退化超 DML 锚点（corr 0.99999969 对 DML 0.99999697；max|Δ| 3.9e-3 对 DML 2.1e-3），而保精度的替代方案天花板均仍在 DML 之上；详见 `docs/benchmarks_zh.md` §6。）
+性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×；`CONV_DIRECT_1D`+融合在全 NSF-HiFiGAN 声码器上 2.50×（11 089 → 4 431 ms，16C/32T Xeon E5-2675 v3、24 线程——快于 2026-08-30 当日实测的 ONNX Runtime CPU EP 4 724 ms fp32）。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.80×；Snake 在 Metal 达 3.05×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.24×；affine_prelu Vulkan 最高 6.3×；gru 补上 RNN 空缺，CPU H512×B4×L32 约 47 ms。补丁四要点：同一直接卷积的 Vulkan 后端以 fp32 跑完整声码器约 430–480 ms（对当日实测 ORT DML EP 282 ms），fp32 一致性比 DML 紧一个数量级（max|Δ| 6.1e-4 对 2.1e-3）。补丁五要点：Vulkan 管线缓存在驱动缓存冷启动时把首跑管线编译成本图内 ≈3×（1 061.5 → ≈350 ms）、进程 wall ≈2×（2 454 → ≈1 200 ms）压缩，数值零影响。**终态说明（2026-08-30）**：追平 Vulkan 与 DML 剩余差距的路径已勘察并刻意止步——唯一可能路线（f16 张量核 GEMM）经 torch 侧模拟精度退化超 DML 锚点（corr 0.99999969 对 DML 0.99999697；max|Δ| 3.9e-3 对 DML 2.1e-3），而保精度的替代方案天花板均仍在 DML 之上；详见 `docs/benchmarks_zh.md` §6。）
 
 ## 后端支持矩阵
 
