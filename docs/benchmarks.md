@@ -305,3 +305,28 @@ The end-to-end B path is **2.7× slower** than the shipped fp32 direct conv (4.6
 - **Theoretical-vs-real precision gap**: the B-sim corr 0.9999996909 assumed `torch.half(x) → fp32 conv` on the torch model; the real chain additionally routes activations through `OpFConvert` inside an im2col shader, packs them into f16 buffers, and feeds an HMMA kernel whose microkernel ordering and tail/padding handling differ.  The pipeline-noise hypothesis (~1.5e-3 max|Δ| per-EP floor) fails to absorb the extra ~8× gap; the error has a fingerprint orthogonal to the EP-noise directions (cross-error correlation ≤ 0.05 against every legal backend).
 
 So the B-vs-E distinction collapses: **a working f16-HMMA path requires the same kernel-engineering surface as the rejected "E" (vendor-specific HMMA pipeline)** — an f16-aware IM2COL variant, in-graph f16 MUL_MAT layout relaxation, an OC=1-safe HMMA route, and re-fused producer epilogues.  All of which is exactly what was ruled out as infra-grade.  The terminal state stands.
+
+### EP-noise band audit and reference-frame note (consumer-side, 2026-08-30 PM)
+
+A dual-golden audit (torch CPU f32 and torch CUDA f32, N=881,664 samples, offset-aligned) that localises where the Vulkan fp32 backend sits relative to the noise band of two already-accepted EP stacks (ORT CPU EP, ORT DML EP):
+
+| candidate @ CPU golden | corr | max\|Δ\| | rms | p99.9 |
+|---|---:|---:|---:|---:|
+| ORT CPU EP | 0.9999999873 | 1.49e-04 | 9.84e-06 | 7.73e-05 |
+| **ggml-Vulkan** | **0.9999998460** | **6.13e-04** | **3.43e-05** | **1.69e-04** |
+| ORT DML EP | 0.9999969745 | 2.09e-03 | 1.52e-04 | 1.08e-03 |
+
+| candidate @ CUDA golden | corr | max\|Δ\| | rms | p99.9 |
+|---|---:|---:|---:|---:|
+| ORT DML EP | 0.9999998863 | 5.72e-04 | 2.95e-05 | 2.63e-04 |
+| ORT CPU EP | 0.9999978486 | 1.43e-03 | 1.28e-04 | 8.47e-04 |
+| torch CPU (golden swap) | 0.9999978463 | 1.52e-03 | 1.28e-04 | 8.52e-04 |
+| **ggml-Vulkan** | **0.9999976269** | **1.55e-03** | **1.35e-04** | **8.84e-04** |
+
+Three conclusions:
+
+1. Under the CPU golden frame ggml-Vulkan sits strictly inside the legitimate-EP band on every metric (corr between DML and ORT-CPU; max|Δ|, rms, p99.9 all within the band edges).
+2. Under the CUDA golden frame the CPU-class implementations (torch CPU ≈ ORT CPU ≈ ggml-Vulkan) cluster at corr 0.9999976–0.9999979 and max|Δ| 1.43e-03–1.55e-03. DML@CUDA 0.9999998863 is the platform floor of that frame (DirectML executes the same f32 GPU math family as the torch-CUDA golden), not a quality advantage — so the CPU-golden ranking overstates the practical gap between ggml-Vulkan and DML.
+3. The f16-rounding simulation of route B lands corr/rms/p99.9 inside the band but max|Δ| = 3.94e-03 (1.88× the band top), with an error direction orthogonal to the EP family (xcorr ≤0.05, projection R²=0.0023, spectral peakiness 19.9–21.7 dB vs 27.4–39.4 dB for legitimate members): a systematic off-direction error, not louder EP noise — consistent with the real-machine NO-GO above.
+
+Measured on RTX 2070 / Xeon E5-2675 v3, MSVC 2019 14.29, ggml v0.19.0 + all four patches; single deterministic forward pass per candidate; raw vectors and the full audit table kept in the consumer's private work directory.

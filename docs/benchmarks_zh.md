@@ -307,3 +307,28 @@ python cmp_align.py vulkan_out.f32   rem 与 torch-CPU golden 做 offset 对齐 
 - 显式 ADD(n=154,92.3 ms)/CPY(n=196,78.1 ms)额外开销。
 
 由此 **B/E 边界在真机上坍缩**:要让 B 达到微基准投影(约 183 ms),必须补齐 f16-dst im2col 专用 kernel、放宽 MUL_MAT 的输入布局限制、做 OC=1 安全的 HMMA 路径并重融合 producer epilogue —— 这正是此前按"基础设施级工程"否决的 E 的全部内容。**终态维持 fp32 direct conv 不变。**
+
+### EP 噪声审计与参照系补记(下游驱动,2026-08-30 PM)
+
+双黄金帧审计(torch CPU f32 与 torch CUDA f32,N=881 664 采样,offset 对齐),用于定位 Vulkan fp32 后端相对于两条已接受 EP 栈(ORT CPU EP、ORT DML EP)噪声带的位置:
+
+| 候选 @ CPU 黄金帧 | corr | max\|Δ\| | rms | p99.9 |
+|---|---:|---:|---:|---:|
+| ORT CPU EP | 0.9999999873 | 1.49e-04 | 9.84e-06 | 7.73e-05 |
+| **ggml-Vulkan** | **0.9999998460** | **6.13e-04** | **3.43e-05** | **1.69e-04** |
+| ORT DML EP | 0.9999969745 | 2.09e-03 | 1.52e-04 | 1.08e-03 |
+
+| 候选 @ CUDA 黄金帧 | corr | max\|Δ\| | rms | p99.9 |
+|---|---:|---:|---:|---:|
+| ORT DML EP | 0.9999998863 | 5.72e-04 | 2.95e-05 | 2.63e-04 |
+| ORT CPU EP | 0.9999978486 | 1.43e-03 | 1.28e-04 | 8.47e-04 |
+| torch CPU(黄金对换) | 0.9999978463 | 1.52e-03 | 1.28e-04 | 8.52e-04 |
+| **ggml-Vulkan** | **0.9999976269** | **1.55e-03** | **1.35e-04** | **8.84e-04** |
+
+三条结论:
+
+1. CPU 黄金帧下 ggml-Vulkan 每个指标都严格落在合法 EP 带内(corr 位于 DML 与 ORT-CPU 之间;max|Δ|、rms、p99.9 均在带的两端之内)。
+2. CUDA 黄金帧下 CPU 系实现(torch CPU ≈ ORT CPU ≈ ggml-Vulkan)紧簇在 corr 0.9999976–0.9999979、max|Δ| 1.43e-03–1.55e-03。DML@CUDA 的 0.9999998863 是该帧的平台底(DirectML 与 torch-CUDA golden 同族 f32 GPU 数学),不是质量优势 —— 因此 CPU 黄金帧的排序会夸大 ggml-Vulkan 与 DML 的实际差距。
+3. B 方案的 f16 舍入仿真 corr/rms/p99.9 落在带内,但 max|Δ|=3.94e-03(带顶 1.88×),且误差方向与 EP 族正交(互相关 ≤0.05,投影 R²=0.0023,谱峰度 19.9–21.7 dB 对合法成员 27.4–39.4 dB):属方向偏离的系统性误差而非更脏的 EP 噪声 —— 与上文真机 NO-GO 结论一致。
+
+测量环境:RTX 2070 / Xeon E5-2675 v3,MSVC 2019 14.29,ggml v0.19.0 + 全部四个补丁;每候选单次确定性前向;原始向量与完整审计表留存下游私有工作目录。
