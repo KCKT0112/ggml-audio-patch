@@ -273,3 +273,14 @@ python cmp_align.py vulkan_out.f32   rem offset-aligned corr vs torch-CPU golden
 ```
 
 A 21-case correctness harness (`tools/test_conv_direct.cpp`, includes the production level-0 shapes plus chain/resblock compositions) passes 21/21 with max|Δ| ≤ 5.5e-5 on the Vulkan path vs the CPU `_fused` op.
+
+## Closing the Vulkan↔DML gap — investigated, deliberately stopped (2026-08-30)
+
+The remaining ~1.5× gap (Vulkan 430–480 ms vs ORT DML EP 281.6 ms — same-session n=10 anchor, 2026-08-30 afternoon; the morning anchor that day was 325.8 ms) was scoped. Every route either fails the precision contract or demands engine-level infrastructure the patch set does not want to own:
+
+- **f16 tensor-core GEMM** (the only route with enough raw headroom: im2col + `KHR_cooperative_matrix`, f16 operands with f32 accumulate): torch-side simulation rounding conv operands through `torch.half` before the fp32 forward gives, for operand-rounded **corr 0.99999969 / max|Δ| 3.94e-3** (weights-only: 0.99999993 / 5.80e-4; activations-only: 0.99999977 / 2.11e-3). The DML anchor is corr 0.99999697 / max|Δ| 2.09e-3 — the full-f16 route would land **below DML precision while only reaching DML-class speed**. Activation rounding dominates the error, and Turing HMMA offers no mixed f16×f32 mode, so there is no hardware-reachable middle point inside this design.
+- **fp32 shader micro-tuning** (float4 loads, workgroup retune, window double-buffering): realistic ceiling ≈ 330–380 ms end-to-end — still above DML. The shader has already been iterated past its low-hanging fruit (variant sweep: e64 BM=128 BN=64 best as a set; per-shape re-picks regressed production).
+- **Winograd** on the K=3 resblock convs is dominated by micro-tuning (same ceiling class, higher cost, plus a numerics hearing).
+- **Precision-preserving tensor-core use** (split-f16/Kahan-style decomposition GEMM) is infrastructure-grade: a numerically-correct matrix-engine + per-vendor extension matrix maintenance, deliberately out of scope, mirroring the cross-ISA maintenance refusal on the CPU side.
+
+So **430–480 ms fp32 with max|Δ| 6.1e-4 against the torch golden (10× tighter than DML) is the shipped terminal state** of the Vulkan path. The experimental knob scaffolding used for the CPU cache-blocking hearing (`GGML_CONV_TSB`/`GGML_CONV_OSB_KB`/`GGML_CONV_ORDER`) never entered any shipped patch — sandbox rebuild from stock v0.19.0 + patch 1 reproduced the headline CPU claim bit-identically (output MD5 match), corr 0.99999999, T24 4 487 ms vs 4 490 ms interleaved A/B on the reference binary.
