@@ -244,7 +244,7 @@ Stock ggml has no RNN cell — the comparison column is the *existence* of this 
 
 End-to-end (median of each run set):
 
-| path | time (ms) | corr vs torch-CPU fp32 out | max|Δ| |
+| path | time (ms) | corr vs torch-CPU fp32 out | max\|Δ\| |
 |---|---|---|---|
 | ONNX Runtime CPU EP (median of 9) | 5 155.0 | 0.9999999873 | — |
 | ONNX Runtime DML EP (median of 9) | 325.8 | 0.99999697 | 2.09e-03 |
@@ -276,7 +276,7 @@ A 21-case correctness harness (`tools/test_conv_direct.cpp`, includes the produc
 
 ## Closing the Vulkan↔DML gap — investigated, deliberately stopped (2026-08-30)
 
-The remaining ~1.5× gap (Vulkan 430–480 ms vs ORT DML EP 281.6 ms — same-session n=10 anchor, 2026-08-30 afternoon; the morning anchor that day was 325.8 ms) was scoped. Every route either fails the precision contract or demands engine-level infrastructure the patch set does not want to own:
+The remaining ~1.5× gap (Vulkan 430–480 ms vs ORT DML EP 281.6 ms — n=10 batch anchor, 2026-08-30 afternoon; the morning anchor that day was 325.8 ms) was scoped. Every route either fails the precision contract or demands engine-level infrastructure the patch set does not want to own:
 
 - **f16 tensor-core GEMM** (the only route with enough raw headroom: im2col + `KHR_cooperative_matrix`, f16 operands with f32 accumulate): torch-side simulation rounding conv operands through `torch.half` before the fp32 forward gives, for operand-rounded **corr 0.99999969 / max|Δ| 3.94e-3** (weights-only: 0.99999993 / 5.80e-4; activations-only: 0.99999977 / 2.11e-3). The DML anchor is corr 0.99999697 / max|Δ| 2.09e-3 — the full-f16 route would land **below DML precision while only reaching DML-class speed**. Activation rounding dominates the error, and Turing HMMA offers no mixed f16×f32 mode, so there is no hardware-reachable middle point inside this design.
 - **fp32 shader micro-tuning** (float4 loads, workgroup retune, window double-buffering): realistic ceiling ≈ 330–380 ms end-to-end — still above DML. The shader has already been iterated past its low-hanging fruit (variant sweep: e64 BM=128 BN=64 best as a set; per-shape re-picks regressed production).
@@ -289,8 +289,8 @@ So **430–480 ms fp32 with max|Δ| 6.1e-4 against the torch golden (10× tighte
 
 A follow-up acceptance update (DML-equivalent precision gate: corr/rms/p999 ≥ ORT-DML and max|Δ| ≤ 2× DML) cleared the consumer to actually wire the f16-HMMA route end-to-end.  The spike adds a `PCNSF_BHMMA=1` branch in the consumer's graph builder: every conv with `K >= 3` goes through `cast(w) → f16` + `im2col_fast_1d(src=f32 → dst=f16)` + contiguous B + `ggml_mul_mat(f16 × f16 → f32, coopmat)`; the producer-side fusions are disabled on this path (explicit `+bias / leaky / res` nodes after the GEMM).  It exists only in the consumer's stash ("BHMMA spike"), no shipped patch changed.  Result on the same 20 s clip (RTX 2070, ggml v0.19.0 + patch 4):
 
-| configuration | wall (warm, n=7 after first) | corr vs CPU golden | max|Δ| | rms |
-|---|---|---|---|---|---|
+| configuration | wall (warm, n=7 after first) | corr vs CPU golden | max\|Δ\| | rms |
+|---|---|---|---|---|
 | **B-HMMA spike** | **1 294.1 ms** | **0.9999902022** | **1.365e-02** | 2.73e-04 |
 | stock fp32 direct conv | 433–480 ms | 0.9999998460 | 6.13e-04 | 3.43e-05 |
 | ORT DML EP | ~282 ms | 0.9999969745 | 2.09e-03 | 1.52e-04 |
