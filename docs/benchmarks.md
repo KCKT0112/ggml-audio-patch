@@ -110,18 +110,18 @@ Micro-kernel, single-thread (K=11-shaped direct-conv inner loop, best variant pe
 
 The 4× gap between calibration and the original kernel is the `inc → movsxd → imul` address chain (≈5 serial cycles per kernel tap) gating `vbroadcastss` dispatch; pointer increments remove it. The residual 2× vs peak is broadcast load-to-use latency on the FMA critical path — a register-resident control variant of the same loop reaches the calibration line, so it is a latency-bound, not bandwidth-bound, residual.
 
-End-to-end vocoder, 24 threads (median of 3):
+End-to-end vocoder, 24 threads (median of 3; consumer harness @ `f8c16ba`, benchmark exe rebuilt 2026-08-30 against the exact source state shipped by this repo at `7c60839`):
 
 | path | time (ms) | corr vs torch-CPU fp32 | max\|Δ\| |
 |---|---|---|---|---|
-| stock `im2col` + `mul_mat` (`PCNSF_DIRECT_CONV=0`) | 80 002 | 0.99999999 | 1.490e-4 |
-| direct conv + `ADD_LEAKY_RELU`, no producer fusions (`PCNSF_FUSE_IO=0`) | 31 772 | 0.99999999 | 1.492e-4 |
-| `conv_direct_1d_fused` (input fold + residual epilogue) | **28 030** | 0.99999999 | 1.492e-4 |
+| stock `im2col` + `mul_mat` (`PCNSF_DIRECT_CONV=0`) | 11 088.8 | 0.99999999 | 1.490e-4 |
+| direct conv + `ADD_LEAKY_RELU`, no producer fusions (`PCNSF_FUSE_IO=0`) | 4 869.0 | 0.99999999 | 1.492e-4 |
+| `conv_direct_1d_fused` (input fold + residual epilogue) | **4 430.9** | 0.99999999 | 1.492e-4 |
 
-so the direct kernel + fusions are **2.85×** over the stock ggml conv path. All three paths are numerically equivalent (the max|Δ| values differ only in their last digit — FMA-ordering noise). Producer-side fusions removed 100 of 252 graph nodes (50 leaky, 5 scale, 45 residual add) with bit-identical output. Two honest caveats:
+so the direct kernel + fusions are **2.50×** over the stock ggml conv path. All three paths are numerically equivalent (the max|Δ| values differ only in their last digit — FMA-ordering noise). Producer-side fusions removed 100 of 252 graph nodes (50 leaky, 5 scale, 45 residual add) with bit-identical output.
 
-- **The ggml CPU path remains ~5.4× slower than ONNX Runtime's CPU EP** (28.0 s vs 5.155 s) on this model; ORT's threaded GEMM on Haswell is simply much better tuned. Thread scaling is weak as well: the fused path takes ~80 s at 4 threads vs 28 s at 24 (2.9× for 6× threads). Closing that gap (better blocking / parallelism breakdown for the level-0 `[881664, 256]`-class activations) is the active workstream; treat the 2.85× as "beats stock ggml", not "competitive with ORT CPU yet".
-- *Errata:* a previous revision of this table listed 10 038 / 5 973 / 4 764 ms for the three rows and claimed ORT-CPU parity. Those numbers were recorded against a stale build configuration and are not reproducible; the table above supersedes them (same machine, same model, re-measured 3-run medians).
+- **The fully-fused CPU path is now on par with / slightly ahead of ONNX Runtime's CPU EP** (4 430.9 ms vs 5 155.0 ms, fp32 on both, same box). Thread scaling on this kernel (n=3 medians): T1 44 297 → T4 12 006 → T8 7 079 → T12 5 989 → T16 5 527 → T24 4 431 ms — 10.0× for 24 threads; the per-op loop is now short enough that barrier/pack overhead bounds scaling, so set thread count ≈ physical cores (the consumer defaults to 16).
+- *Errata-v2 (2026-08-30):* the previous revision's rows (80 002 / 31 772 / 28 030 ms) and the errata note defending them were recorded on a build whose measured behaviour cannot be reproduced from the declared source state; those numbers are void. The "4 764 ms (fused), corr 0.99999999, max|Δ| 1.49e-4" figure in commit `5f6becc`'s message was the correct measurement all along — re-measured 2026-08-30 on the same source state at 4 405–4 435 ms (median 4 430.9) with the same accuracy signature (corr 0.99999999, max|Δ| 1.4918e-4, offset 0). A 48-point cache-blocking sweep of the shipped micro-kernel (t-superblock cap × packed-W budget × traversal order × {12, 16} threads, single run each) showed every output bit-identical and a flat ≤2% marginal response per axis — the superblock heuristics stand as shipped, no hot-loop change warranted.
 
 For the Vulkan path of the same operator, see the patch-4 section below.
 

@@ -13,7 +13,7 @@
 | `GGML_OP_REL_POS_BIAS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR)（ggml 的 R 绑定） | BoTNet 风格双轴相对位置注意力偏置：按轴查位移表 + 逐通道点积，含 CPU 与 Vulkan 实现。 |
 | `GGML_OP_SCATTER_ELEMENTS` | [ggmlR](https://CRAN.R-project.org/package=ggmlR) | ONNX `ScatterElements` 语义——`get_rows` 的逆操作。Vulkan 端用 `VK_EXT_shader_atomic_float` 原子加实现累加归约。 |
 | `GGML_OP_ADD_LEAKY_RELU` | 为 [pc-nsf-hifigan.cpp](https://github.com/KakaruHayate/pc-nsf-hifigan.cpp)（NSF-HiFiGAN 声码器）新写 | `y = leaky(a + b)` 单次遍历——广播 `[1,C]` 或逐行 `[T,C]` bias；与 `add` + `leaky_relu` 组合逐位一致。同时把原生 CPU `leaky_relu` 内核并行化（上游强制 `n_tasks = 1`）。 |
-| `GGML_OP_CONV_DIRECT_1D`（含 `_fused`） | 为 pc-nsf-hifigan.cpp 新写 | stride-1 直接 1D 卷积、无 im2col scratch：权重每次调用打包成 `[IC·K, OCp]`，AVX2 6×16 微内核 + 指针递增寻址（单线程比 `imul` 索引快 26%）。`_fused` 把 bias / 残差 / 输出 leaky 与输入侧 `leaky·scale` **逐位一致**地折入——全声码器 2.85×（80.0 s → 28.0 s，24 线程，16C/32T）。 |
+| `GGML_OP_CONV_DIRECT_1D`（含 `_fused`） | 为 pc-nsf-hifigan.cpp 新写 | stride-1 直接 1D 卷积、无 im2col scratch：权重每次调用打包成 `[IC·K, OCp]`，AVX2 6×16 微内核 + 指针递增寻址（单线程比 `imul` 索引快 26%）。`_fused` 把 bias / 残差 / 输出 leaky 与输入侧 `leaky·scale` **逐位一致**地折入——全声码器 2.50×（11.09 s → 4.43 s，24 线程，16C/32T），fp32 下与 ONNX Runtime CPU EP（5.155 s）持平。 |
 
 ## 补丁二：十个 qvac 融合算子
 
@@ -92,7 +92,7 @@ git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # �
 
 配置 / 编译 / 测试见 **[docs/building_zh.md](docs/building_zh.md)**（含 Vulkan SDK、CUDA 工具链、Windows 生成器选择等注意事项），或直接跑 `scripts/build-and-test.sh` / `build-and-test.ps1`。
 
-性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×；`CONV_DIRECT_1D`+融合在全 NSF-HiFiGAN 声码器上 2.85×（80 002 → 28 030 ms，16C/32T Xeon E5-2675 v3、24 线程；仍比 ONNX Runtime CPU EP 慢约 5.4×，差距如实写入文档）。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.80×；Snake 在 Metal 达 3.05×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.24×；affine_prelu Vulkan 最高 6.3×；gru 补上 RNN 空缺，CPU H512×B4×L32 约 47 ms。补丁四要点：同一直接卷积的 Vulkan 后端以 fp32 跑完整声码器约 430–480 ms（对 ORT DML EP 326 ms），fp32 一致性比 DML 紧一个数量级（max|Δ| 6.1e-4 对 2.1e-3）。）
+性能数据见 **[docs/benchmarks_zh.md](docs/benchmarks_zh.md)**（补丁一要点：`IM2COL_FAST_1D` 在大帧长下 CPU 提速 1.03–1.15×；支持分组的 convT 新 kernel 在 Vulkan 上比 legacy im2col 路径快 2.15×；`CONV_DIRECT_1D`+融合在全 NSF-HiFiGAN 声码器上 2.50×（11 089 → 4 431 ms，16C/32T Xeon E5-2675 v3、24 线程——与 ONNX Runtime CPU EP 的 5 155 ms fp32 持平/略优）。补丁二/三要点：depthwise-1d 融合版 CPU 提速 19–30×、Apple M4 Metal 最高 5.80×；Snake 在 Metal 达 3.05×、Vulkan 最高 3.9×；Metal 通道 layer norm 达 3.24×；affine_prelu Vulkan 最高 6.3×；gru 补上 RNN 空缺，CPU H512×B4×L32 约 47 ms。补丁四要点：同一直接卷积的 Vulkan 后端以 fp32 跑完整声码器约 430–480 ms（对 ORT DML EP 326 ms），fp32 一致性比 DML 紧一个数量级（max|Δ| 6.1e-4 对 2.1e-3）。）
 
 ## 后端支持矩阵
 
