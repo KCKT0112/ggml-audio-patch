@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Benchmark: qvac-ops fused kernels vs equivalent composed sub-graphs.
 //
 // Usage: bench_qvac_ops [cpu|vulkan|metal] [threads]

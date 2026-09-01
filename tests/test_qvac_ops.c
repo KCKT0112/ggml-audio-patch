@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Smoke tests for the qvac-ops patch (applies on top of the learned-ops patch,
 // ggml v0.19.0 base). Ported from tetherto/qvac-ext-ggml (speech branch, MIT).
 // Verifies, against hand-rolled references:

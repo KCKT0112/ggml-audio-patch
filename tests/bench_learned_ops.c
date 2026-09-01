@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Benchmark: learned-ops vs native ggml implementations.
 //
 // Usage: bench_learned_ops [cpu|cuda|vulkan]

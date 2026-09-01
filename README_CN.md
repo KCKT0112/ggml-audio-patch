@@ -139,4 +139,13 @@ git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # �
 
 ## 许可证与出处
 
-[MIT](LICENSE)，与上游 ggml 一致。各算子的原始实现分属其上游项目（audio.cpp、TTS.cpp、ggmlR、ggml，以及补丁二的 [tetherto/qvac-ext-ggml](https://github.com/tetherto/qvac-ext-ggml)）；本仓库仅做重定基、接口对齐、bug 修复与后端/测试补全。逐算子的致谢与出处见 [docs/operators_zh.md](docs/operators_zh.md)。
+[MPL-2.0](LICENSE) —— Mozilla Public License 2.0；**例外**：`patches/` 目录采用 `MIT OR Apache-2.0`
+双许可（见 [patches/LICENSE](patches/LICENSE)），以保证这些补丁仍可被上游 ggml 接纳。
+
+各算子的原始实现分属其上游项目（audio.cpp、TTS.cpp、ggmlR、ggml，以及补丁二的
+[tetherto/qvac-ext-ggml](https://github.com/tetherto/qvac-ext-ggml)）；本仓库仅做重定基、接口对齐、
+bug 修复与后端/测试补全。这些上游许可**不因本仓库变更而失效**——原作者给出的授权不可撤销，
+源自其代码的部分仍可按原始条款使用。
+
+逐算子的致谢与出处见 [docs/operators_zh.md](docs/operators_zh.md)，完整许可与出处记录见
+[NOTICE.md](NOTICE.md)。

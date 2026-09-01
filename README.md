@@ -139,4 +139,15 @@ Unsupported parameter combinations are rejected by each backend's `supports_op`,
 
 ## License & attribution
 
-[MIT](LICENSE), matching upstream ggml. The original operator implementations belong to their respective upstream projects (audio.cpp, TTS.cpp, ggmlR, ggml, and [tetherto/qvac-ext-ggml](https://github.com/tetherto/qvac-ext-ggml) for patch 2); this repository only re-bases, aligns APIs, fixes bugs, and adds backends/tests. Detailed credit notes per operator live in [docs/operators.md](docs/operators.md).
+[MPL-2.0](LICENSE) — Mozilla Public License 2.0, **except** the `patches/` directory, which is
+dual-licensed `MIT OR Apache-2.0` (see [patches/LICENSE](patches/LICENSE)) so the diffs stay
+acceptable to upstream ggml.
+
+The original operator implementations belong to their respective upstream projects (audio.cpp,
+TTS.cpp, ggmlR, ggml, and [tetherto/qvac-ext-ggml](https://github.com/tetherto/qvac-ext-ggml) for
+patch 2); this repository only re-bases, aligns APIs, fixes bugs, and adds backends/tests. Their
+original licenses are **not** superseded — the grants those authors issued are irrevocable, so
+portions derived from their code remain available under their original terms as well.
+
+Detailed credit notes per operator live in [docs/operators.md](docs/operators.md), and the full
+provenance and license record in [NOTICE.md](NOTICE.md).

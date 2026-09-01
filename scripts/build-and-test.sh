@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
 # 一键构建 + 冒烟测试（Linux/macOS）
 # 用法： bash scripts/build-and-test.sh [vulkan]
 #   无参数  -> CPU-only 构建并测试

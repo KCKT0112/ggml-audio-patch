@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Smoke tests for the learned-ops patch (ggml v0.19.0 base).
 // Verifies, against hand-rolled references:
 //   1. ggml_conv_1d_fast_1d_im2col == ggml_conv_1d        (CPU reference kernels)

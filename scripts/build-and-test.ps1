@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MPL-2.0
 # 一键构建 + 冒烟测试（Windows pwsh）
 # 用法： .\scripts\build-and-test.ps1 [-Vulkan]
 # 前置： VS2019/2022 BuildTools、CMake（VS 自带即可）、Vulkan SDK（-Vulkan 时）
