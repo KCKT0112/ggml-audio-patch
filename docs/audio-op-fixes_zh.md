@@ -14,7 +14,7 @@ ggml 工作树差异生成，一至六保持不变。修复对应 pc-nsf-hifigan
 - CPU 直接卷积按 `w->nb[]` 字节偏移打包权重，按 `bias->nb[0]` 读取 bias，
   正确处理非连续视图。GPU 的连续性要求不变。
 
-`tests/test_audio_op_regressions.cpp` 包含 12 项 CPU 用例：四个 scatter 轴和
+`tests/test_audio_op_regressions.cpp` 包含 14 项 CPU 用例：四个 scatter 轴和
 两种 reduction、分组/非分组转置卷积的非整除 padding，以及连续/非连续的直接
 卷积权重和 bias。测试检查结果有限且符合明确的期望值。集合原有参考函数和
 误差阈值均未修改。
@@ -28,5 +28,7 @@ build-vulkan-tests/test_audio_op_regressions Vulkan0
 ```
 
 CPU 验证环境：Apple M4、macOS 27.0、AppleClang 21、Release、2026-09-05：
-`CPU: 12 passed, 0 unsupported`。Vulkan 运行验证由 consumer PR 的 Linux/Mesa
+`CPU: 14 passed, 0 unsupported`。Vulkan 运行验证由 consumer PR 的 Linux/Mesa
 CI 任务执行，未在本 macOS 主机上运行。
+
+补丁八另外修复 AVX2 工作区对齐：两个新增用例故意使用非 32 字节对齐的 scratch；原有 CPU 算术顺序不变。

@@ -17,7 +17,7 @@ These fixes address the operator findings in pc-nsf-hifigan.cpp PR #2.
   using `bias->nb[0]`, honoring non-contiguous views. GPU contiguity restrictions
   remain unchanged.
 
-`tests/test_audio_op_regressions.cpp` contains 12 CPU cases: all four scatter
+`tests/test_audio_op_regressions.cpp` contains 14 CPU cases: all four scatter
 axes and both reductions, grouped/ungrouped transposed convolution with
 non-dividing padding, and contiguous/strided direct-convolution weights and
 biases. It checks finite outputs against explicit expected results. The
@@ -32,5 +32,7 @@ build-vulkan-tests/test_audio_op_regressions Vulkan0
 ```
 
 CPU verification: Apple M4, macOS 27.0, AppleClang 21, Release, 2026-09-05:
-`CPU: 12 passed, 0 unsupported`. Vulkan runtime validation is provided by the
+`CPU: 14 passed, 0 unsupported`. Vulkan runtime validation is provided by the
 consumer PR's Linux/Mesa CI job; it was not run on this macOS host.
+
+Patch 8 additionally fixes AVX2 scratch alignment; two added cases deliberately use scratch not aligned to 32 bytes, without changing CPU arithmetic order.

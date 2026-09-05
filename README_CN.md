@@ -2,7 +2,7 @@
 
 > 中文 | **[English](README.md)**
 
-一套精选补丁，把**十六个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：十四个取自 ggml 生态不同项目——API 对齐上游规范、修复原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持；另有两个为 NSF-HiFiGAN 声码器在本仓库新写（融合 bias 加 + leaky ReLU；带生产侧融合的 stride-1 直接 1D 卷积）。以七个统一 diff 交付（按序应用，Metal 补丁三/六可按平台跳过；补丁五为 Vulkan 管线缓存增强），另附正确性测试与跨后端基准程序。
+一套精选补丁，把**十六个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：十四个取自 ggml 生态不同项目——API 对齐上游规范、修复原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持；另有两个为 NSF-HiFiGAN 声码器在本仓库新写（融合 bias 加 + leaky ReLU；带生产侧融合的 stride-1 直接 1D 卷积）。以八个统一 diff 交付（按序应用，Metal 补丁三/六可按平台跳过；补丁五为 Vulkan 管线缓存增强），另附正确性测试与跨后端基准程序。
 
 ## 补丁一：六个 learned 算子
 
@@ -67,7 +67,11 @@
 
 ## 补丁七：音频算子正确性修复
 
-`audio-op-fixes-ggml0190.patch` 修复 CPU/Vulkan ScatterElements 索引处理（合法负索引归一化，越界更新在计算地址前丢弃）、允许与 stride 无整除关系的非负转置卷积 padding，并让 CPU 直接卷积按权重/bias 的字节 stride 取值。原有连续张量、合法正索引的语义不变。在现有补丁栈之后应用，一至六保持不变。`tests/test_audio_op_regressions.cpp` 覆盖 12 项 CPU 回归，也可用 `Vulkan0` 运行支持的用例。详见 [算子修复](docs/audio-op-fixes_zh.md)。
+`audio-op-fixes-ggml0190.patch` 修复 CPU/Vulkan ScatterElements 索引处理（合法负索引归一化，越界更新在计算地址前丢弃）、允许与 stride 无整除关系的非负转置卷积 padding，并让 CPU 直接卷积按权重/bias 的字节 stride 取值。原有连续张量、合法正索引的语义不变。在现有补丁栈之后应用，一至六保持不变。`tests/test_audio_op_regressions.cpp` 覆盖 14 项 CPU 回归，也可用 `Vulkan0` 运行支持的用例。详见 [算子修复](docs/audio-op-fixes_zh.md)。
+
+## 补丁八：AVX2 直接卷积工作区对齐
+
+`cpu-direct-conv-alignment-ggml0190.patch` 为打包权重使用非对齐 AVX2 load：CPU graph-plan 工作区来自 `new[]`，不保证 32 字节对齐。它修复了新回归测试暴露的 Linux 崩溃。新增两个测试故意将工作区放在距 32 字节边界偏移 16 字节的位置。在补丁七之后应用，原有补丁文件保持不变。
 
 基线：ggml [`30bf868`](https://github.com/ggml-org/ggml)（v0.19.0）。diff 只在枚举/builder/kernel 的插入点上做增量，应用到邻近 commit 通常只需少量冲突处理。
 
@@ -112,6 +116,7 @@ git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # �
 git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # 补丁五（在补丁四之后；也可独立应用于原生 v0.19.0）
 git apply ../ggml-audio-patch/patches/metal-conv-direct-1d-ggml0190.patch   # 补丁六（需要一+二+三）
 git apply ../ggml-audio-patch/patches/audio-op-fixes-ggml0190.patch       # patch 7
+git apply ../ggml-audio-patch/patches/cpu-direct-conv-alignment-ggml0190.patch  # patch 8
 ```
 
 补丁二必须跟在补丁一之后：两者触碰相同的枚举断言与分发代码块。非 Metal 平台可不应用补丁三。补丁四必须跟在补丁一、二之后：它消费补丁一的 `CONV_DIRECT_1D`，并与补丁二共用 shader 注册表/分发插入点（与补丁三正交——无论装不装 Metal 补丁都可同样应用）。补丁五已验证既可独立应用于原生 v0.19.0，也可叠加在补丁 1–4 之上——组合应用时**在补丁四之后装**（它与补丁四都改 `src/ggml-vulkan/ggml-vulkan.cpp`）。只装补丁一可以（跳过后续）；只装一+四**不支持**。

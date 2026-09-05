@@ -1,0 +1,17 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 3fe1104..a21368c 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -11274,8 +11274,10 @@ void ggml_compute_forward_conv_direct_1d(
+                         const float * xp = Xp + ic * L + t0;
+                         const float * wp = Wb + ic * K * OCp;
+                         for (int kw = 0; kw < K; ++kw, xp += dil, wp += OCp) {
+-                            const __m256 w0 = _mm256_load_ps(wp);
+-                            const __m256 w1 = _mm256_load_ps(wp + 8);
++                            // CPU graph-plan scratch uses new[] and need not be
++                            // 32-byte aligned; packed row sizes do not fix its base.
++                            const __m256 w0 = _mm256_loadu_ps(wp);
++                            const __m256 w1 = _mm256_loadu_ps(wp + 8);
+                             a00 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 0), w0, a00);
+                             a01 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 0), w1, a01);
+                             a10 = _mm256_fmadd_ps(_mm256_broadcast_ss(xp + 1), w0, a10);

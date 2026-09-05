@@ -40,8 +40,16 @@ struct Graph {
         require(ggml_gallocr_alloc_graph(alloc, graph), "graph allocation failed");
         return true;
     }
-    void compare(ggml_tensor * y, const std::vector<float> & expected) {
-        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "compute failed");
+    void compare(ggml_tensor * y, const std::vector<float> & expected, bool unaligned_scratch = false) {
+        if (unaligned_scratch) {
+            ggml_cplan plan = ggml_graph_plan(graph, 1, nullptr);
+            std::vector<uint8_t> scratch(plan.work_size + 64);
+            uintptr_t aligned = (reinterpret_cast<uintptr_t>(scratch.data()) + 31) & ~uintptr_t(31);
+            plan.work_data = reinterpret_cast<uint8_t *>(aligned + 16);
+            require(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS, "unaligned compute failed");
+        } else {
+            require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "compute failed");
+        }
         std::vector<float> actual(expected.size());
         ggml_backend_tensor_get(y, actual.data(), 0, actual.size()*sizeof(float));
         for (size_t i = 0; i < actual.size(); ++i) {
@@ -138,6 +146,7 @@ static void direct_strides(ggml_backend_t backend, bool strided) {
     ggml_backend_tensor_set(bias_storage,biases.data(),0,biases.size()*4);
     ggml_backend_tensor_set(x,input.data(),0,input.size()*4);
     g.compare(y,expected);
+    if (ggml_backend_is_cpu(backend)) g.compare(y,expected,true);
 }
 
 int main(int argc, char ** argv) {
@@ -152,7 +161,7 @@ int main(int argc, char ** argv) {
         direct_strides(backend,false);
         direct_strides(backend,true);
         require(passed>0,"no regression case executed");
-        if (ggml_backend_is_cpu(backend)) require(passed == 12 && skipped == 0, "CPU must execute all regression cases");
+        if (ggml_backend_is_cpu(backend)) require(passed == 14 && skipped == 0, "CPU must execute all regression cases");
         if (std::strncmp(name, "Vulkan", 6) == 0) require(scatter_checks >= 4, "Vulkan must execute scatter on all four axes");
         std::printf("%s: %d passed, %d unsupported\n",name,passed,skipped);
     } catch(const std::exception & e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); result=1; }

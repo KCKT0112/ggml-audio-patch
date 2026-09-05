@@ -27,6 +27,7 @@ git apply <本仓库路径>/patches/vulkan-conv-direct-1d-ggml0190.patch  # 4
 git apply <本仓库路径>/patches/vulkan-pipeline-cache-ggml0190.patch  # 5
 git apply <本仓库路径>/patches/metal-conv-direct-1d-ggml0190.patch   # 6 (Metal)
 git apply <本仓库路径>/patches/audio-op-fixes-ggml0190.patch        # 7
+git apply <本仓库路径>/patches/cpu-direct-conv-alignment-ggml0190.patch        # 8
 ```
 
 补丁二必须**在补丁一之后**应用（两者触碰相同的枚举断言与分发代码块），补丁三必须跟在补丁二之后。只用补丁一完全可行；补丁二或补丁三都不能脱离前序补丁单独使用。
