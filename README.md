@@ -2,7 +2,7 @@
 
 > **[中文文档](README_CN.md)** | English
 
-A curated patch set that ports **sixteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0** — fourteen adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends; plus two authored here for the NSF-HiFiGAN vocoder (a fused bias-add + leaky-ReLU, and a stride-1 direct 1-D convolution with producer-side fusions). Shipped as six unified diffs (applied in sequence; Metal patches 3/6 are platform-optional, patch 5 is a Vulkan pipeline-cache enhancement) plus correctness tests and cross-backend benchmark suites.
+A curated patch set that ports **sixteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0** — fourteen adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends; plus two authored here for the NSF-HiFiGAN vocoder (a fused bias-add + leaky-ReLU, and a stride-1 direct 1-D convolution with producer-side fusions). Shipped as seven unified diffs (applied in sequence; Metal patches 3/6 are platform-optional, patch 5 is a Vulkan pipeline-cache enhancement) plus correctness tests and cross-backend benchmark suites.
 
 ## Patch 1 — the six learned operators
 
@@ -65,6 +65,10 @@ Apply **1 → 2 → 3 → 6**, or the full **1 → 2 → 3 → 4 → 5 → 6** s
 
 See [Metal direct convolution](docs/metal-direct-conv.md) for measurements and reproduction: the 2026-08-31 Apple M4 vocoder run produced 19.992 s of audio in 0.823–0.836 s in the fastest stable series; a nearby-time comparison with ORT CPU measured 1.221 s versus 3.156 s. Collection-level CPU/Metal operator tests were rebuilt and verified on 2026-09-05. Other Apple devices have not been tested.
 
+## Patch 7 — audio operator correctness fixes
+
+`audio-op-fixes-ggml0190.patch` fixes CPU/Vulkan ScatterElements index handling (normalize valid negative indices, discard out-of-range updates before forming an address), permits nonnegative transposed-convolution padding independent of stride, and honors CPU direct-convolution weight/bias byte strides. Existing valid contiguous positive-index cases retain their semantics. Apply after the existing stack; patches 1–6 remain unchanged. `tests/test_audio_op_regressions.cpp` covers 12 CPU cases across these regressions and can run supported cases on `Vulkan0`. See [operator fixes](docs/audio-op-fixes.md).
+
 Base tree: ggml [`30bf868`](https://github.com/ggml-org/ggml) (v0.19.0). The diffs are additive at enum/builder/kernel insertion points, so applying onto nearby commits usually needs only light conflict resolution.
 
 ## Repository layout
@@ -107,6 +111,7 @@ git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch              # pa
 git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # patch 4 (on top of 1+2)
 git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # patch 5 (after patch 4; also applies standalone on stock v0.19.0)
 git apply ../ggml-audio-patch/patches/metal-conv-direct-1d-ggml0190.patch   # patch 6 (requires 1+2+3)
+git apply ../ggml-audio-patch/patches/audio-op-fixes-ggml0190.patch       # patch 7
 ```
 
 Patch 2 must follow patch 1: they touch the same enum-assert and dispatch hunks. Patch 3 is optional on non-Metal platforms. Patch 4 must follow patches 1 and 2: it consumes `CONV_DIRECT_1D` from patch 1 and shares shader-registry/dispatch insertion points with patch 2 (it is orthogonal to patch 3 — apply it with or without the Metal patch). Patch 5 was verified both standalone on stock v0.19.0 and on top of patches 1–4 — when combined, apply it **after patch 4** (it and patch 4 both edit `src/ggml-vulkan/ggml-vulkan.cpp`). Applying only patch 1 is fine (skip the rest); applying only 1+4 is **not** supported.

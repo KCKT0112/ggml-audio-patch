@@ -46,6 +46,7 @@ git -C ../ggml-src apply "$PWD/patches/learned-ops-ggml0190.patch"
 git -C ../ggml-src apply "$PWD/patches/qvac-ops-ggml0190.patch"
 git -C ../ggml-src apply "$PWD/patches/metal-ops-ggml0190.patch"
 git -C ../ggml-src apply "$PWD/patches/metal-conv-direct-1d-ggml0190.patch"
+git -C ../ggml-src apply "$PWD/patches/audio-op-fixes-ggml0190.patch"
 GGML_SRC=../ggml-src bash scripts/build-and-test-metal.sh
 ```
 

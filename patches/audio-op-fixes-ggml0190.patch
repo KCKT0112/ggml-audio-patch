@@ -1,0 +1,88 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 1c0a03b..3fe1104 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -10559,7 +10559,12 @@ void ggml_compute_forward_scatter_elements(
+ 
+         /* Build dst multi-index: same as updates, except axis dim = indices[flat] */
+         int64_t di[4] = { mi[0], mi[1], mi[2], mi[3] };
+-        di[axis] = (int64_t)idx[flat];
++        // Normalize valid ONNX negative indices; reject invalid updates before
++        // computing any destination address (same policy as the Vulkan shader).
++        int64_t scatter_index = idx[flat];
++        if (scatter_index < -dst_ne[axis] || scatter_index >= dst_ne[axis]) continue;
++        if (scatter_index < 0) scatter_index += dst_ne[axis];
++        di[axis] = scatter_index;
+ 
+         int64_t dst_flat = di[0] * dst_stride[0] + di[1] * dst_stride[1]
+                          + di[2] * dst_stride[2] + di[3] * dst_stride[3];
+@@ -11166,14 +11171,18 @@ void ggml_compute_forward_conv_direct_1d(
+         for (int64_t oc = c0; oc < c1; ++oc) {
+             for (int64_t ic = 0; ic < IC; ++ic) {
+                 for (int64_t kw = 0; kw < K; ++kw) {
+-                    // w[kw, ic, oc] row-major: ((oc*IC) + ic)*K + kw
+-                    const float v = (oc < OC)
+-                        ? w_data[((oc * IC) + ic) * K + kw]
+-                        : 0.0f;
++                    // The public direct-conv API permits strided weight views.
++                    float v = 0.0f;
++                    if (oc < OC) {
++                        memcpy(&v, (const char *)w_data + kw*w->nb[0] + ic*w->nb[1] + oc*w->nb[2], sizeof(v));
++                    }
+                     Wt[(ic * K + kw) * OCp + oc] = v;
+                 }
+             }
+-            bp[oc] = (oc < OC && b_data) ? b_data[oc] : 0.0f;
++            bp[oc] = 0.0f;
++            if (oc < OC && b_data) {
++                memcpy(&bp[oc], (const char *)b_data + oc*bias->nb[0], sizeof(float));
++            }
+         }
+     }
+     {
+diff --git a/src/ggml-vulkan/vulkan-shaders/scatter_elements.comp b/src/ggml-vulkan/vulkan-shaders/scatter_elements.comp
+index 1f96a15..b5e42c6 100644
+--- a/src/ggml-vulkan/vulkan-shaders/scatter_elements.comp
++++ b/src/ggml-vulkan/vulkan-shaders/scatter_elements.comp
+@@ -47,13 +47,24 @@ void main() {
+ 
+     /* Read scatter index */
+     const int scatter_idx = data_b[get_boffset() + gid];
++    const uint axis_size = axis == 0 ? p.ne20 : axis == 1 ? p.ne21 : axis == 2 ? p.ne22 : p.ne23;
++    uint normalized_idx;
++    if (scatter_idx < 0) {
++        // Avoid signed overflow even for INT32_MIN.
++        const uint magnitude = uint(-(scatter_idx + 1)) + 1u;
++        if (magnitude > axis_size) return; // reject this update
++        normalized_idx = axis_size - magnitude;
++    } else {
++        normalized_idx = uint(scatter_idx);
++        if (normalized_idx >= axis_size) return; // reject this update
++    }
+ 
+     /* Build dst multi-index: same as updates, except along axis */
+     uint di0 = mi0, di1 = mi1, di2 = mi2, di3 = mi3;
+-    if      (axis == 0) di0 = uint(scatter_idx);
+-    else if (axis == 1) di1 = uint(scatter_idx);
+-    else if (axis == 2) di2 = uint(scatter_idx);
+-    else                di3 = uint(scatter_idx);
++    if      (axis == 0) di0 = normalized_idx;
++    else if (axis == 1) di1 = normalized_idx;
++    else if (axis == 2) di2 = normalized_idx;
++    else                di3 = normalized_idx;
+ 
+     /* dst strides (contiguous): ne20=dst.ne[0], ne21=dst.ne[1], etc. */
+     const uint dst_off = get_doffset() + di0 + di1 * p.ne20 + di2 * p.ne20 * p.ne21 + di3 * p.ne20 * p.ne21 * p.ne22;
+diff --git a/src/ggml.c b/src/ggml.c
+index 855fad0..db083fe 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -4809,7 +4809,7 @@ struct ggml_tensor * ggml_conv_transpose_1d_ext(
+ 
+     GGML_ASSERT(b->ne[1] % g0 == 0);
+     GGML_ASSERT(a->ne[2] == b->ne[1] / g0);
+-    GGML_ASSERT(p0 == 0 || s0 % p0 == 0);
++    GGML_ASSERT(p0 >= 0);
+ 
+     const int64_t ne[4] = {
+         ggml_calc_conv_transpose_1d_output_size(b->ne[0], a->ne[0], s0, p0, d0, op0),
