@@ -359,3 +359,7 @@ python cmp_align.py vulkan_out.f32   rem 与 torch-CPU golden 做 offset 对齐 
 4. 构造"驱动缓存冷"受控 A/B 的尝试未获干净结果:清空 `NVIDIA/DXCache`(2 286 个文件,10.2 GB)已确认清空;持有本应用编译产物的 `NVIDIA/GLCache`(80 文件 / 38 MB,含 16:52 会话写入的 5.6 MB 一对)在一次列表时还在、下一次列表时已消失,**期间并无显式删除**(驱动/服务自管理),且稳态时序并未回落至首跑水平,反而逐跑散布扩大到 ±90 ms。因此除首表第一行的真实首跑外,不宣称任何"驱动冷"数值。
 
 复现(在下游工作目录):`Remove-Item $env:LOCALAPPDATA\ggml_audio_vk_pipeline.cache; $env:GGML_VK_PIPELINE_CACHE_DEBUG=1; $env:PCNSF_TIMING=1; hifigan_cli.exe hifigan_f32.gguf mel.bin f0.bin out.wav`,之后不删 blob 直接重跑;稳态 A/B 用 `$env:GGML_VK_DISABLE_PIPELINE_CACHE=1`。
+
+## 补丁六：Metal 直接卷积
+
+2026-08-31 的 Apple M4 全模型数据及 2026-09-05 的集合测试说明见 [Metal 直接卷积](metal-direct-conv_zh.md#历史声码器测量2026-08-31)。其中包含最快稳定轮、后续波动轮、ORT CPU 相近时间对照和用户长音频单次测量，未把不同机器的数字混作加速比。

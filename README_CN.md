@@ -2,7 +2,7 @@
 
 > 中文 | **[English](README.md)**
 
-一套精选补丁，把**十六个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：十四个取自 ggml 生态不同项目——API 对齐上游规范、修复原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持；另有两个为 NSF-HiFiGAN 声码器在本仓库新写（融合 bias 加 + leaky ReLU；带生产侧融合的 stride-1 直接 1D 卷积）。以五个统一 diff 交付（按序应用，Metal 补丁可按平台跳过；最后一个是不含算子内容的 Vulkan 管线缓存增强），另附正确性测试与跨后端基准程序。
+一套精选补丁，把**十六个音频域算子**统一移植进 [ggml](https://github.com/ggml-org/ggml) **v0.19.0**：十四个取自 ggml 生态不同项目——API 对齐上游规范、修复原生实现的 bug、并按后端能力补齐 CPU / Vulkan / CUDA / Metal 支持；另有两个为 NSF-HiFiGAN 声码器在本仓库新写（融合 bias 加 + leaky ReLU；带生产侧融合的 stride-1 直接 1D 卷积）。以六个统一 diff 交付（按序应用，Metal 补丁三/六可按平台跳过；补丁五为 Vulkan 管线缓存增强），另附正确性测试与跨后端基准程序。
 
 ## 补丁一：六个 learned 算子
 
@@ -57,6 +57,14 @@
 - 实测（2026-08-30，Windows 11，Xeon E5-2675 v3，RTX 2070 驱动 32.0.16.2002，MSVC 14.29，pc-nsf-hifigan.cpp `hifigan_cli`，参考片段 T=1722，blob 334 150 B）：无 blob 时新补丁二进制的首跑会把管线编译计进第一次计算——图内 1 061.5 ms / 进程 wall 2 454 ms；此后带 blob 的进程重启稳定在图内 346.8–355.0 ms / wall ≈1 120–1 290 ms。首跑成本图内 ≈3×、wall ≈2× 缩减。
 - 如实说明：本测试机上 NVIDIA 驱动自身的 shader 缓存（…/NVIDIA/GLCache）同样跨进程保存编译产物；该层命中时，blob 在稳态没有可测增益（交叉实测中位数 ON 376.1 对 OFF 373.1 ms，n=3，机器散布 ±10%）。blob 的价值体现在驱动缓存冷/被逐出时——驱动升级/重装或缓存清理后的首跑、缓存容量受限的配置、缓存能力弱的驱动/平台。复现命令与完整运行表见 [docs/benchmarks_zh.md](docs/benchmarks_zh.md#补丁五--vulkan-管线持久缓存)。
 
+## 补丁六：Metal F32 融合直接卷积
+
+新增 `CONV_DIRECT_1D` / `_fused` 的 Metal implicit-GEMM 实现：`16×64`、`32×64`、`64×64` simdgroup-matrix tile 和 `OC < 8` scalar 路径，融合 bias、residual、输入 scale/leaky 和输出 leaky，省去 im2col 中间张量。补丁也补齐 `IM2COL_FAST_1D` 的 Metal 能力声明。
+
+应用顺序为 **1 → 2 → 3 → 6**，或完整 **1 → 2 → 3 → 4 → 5 → 6**。不修改 CPU/Vulkan/CUDA kernel 或公共算子语义。Metal 要求 F32、连续的单序列张量与 Apple7 simdgroup-matrix 能力；直接执行图的调用方必须先查询 `supports_op`，不支持时选择原有图或 scheduler 回落。
+
+实测与复现见 [Metal 直接卷积](docs/metal-direct-conv_zh.md)：2026-08-31 的 Apple M4 声码器测试中，19.992 s 音频最快稳定轮为 0.823–0.836 s；与 ORT CPU 的相近时间窗口对照为 1.221 s 对 3.156 s。2026-09-05 在集合仓库重新构建并验证 CPU/Metal 算子测试。其他 Apple 设备尚未真机验证。
+
 基线：ggml [`30bf868`](https://github.com/ggml-org/ggml)（v0.19.0）。diff 只在枚举/builder/kernel 的插入点上做增量，应用到邻近 commit 通常只需少量冲突处理。
 
 ## 目录结构
@@ -68,7 +76,8 @@ ggml-audio-patch/
 │   ├── qvac-ops-ggml0190.patch      # 叠加在补丁一之上的统一 diff（补丁二）
 │   ├── metal-ops-ggml0190.patch     # 叠加在补丁二之上的 Metal 集成（补丁三）
 │   ├── vulkan-conv-direct-1d-ggml0190.patch  # CONV_DIRECT_1D 的 Vulkan 后端（补丁四，叠加于一+二）
-│   └── vulkan-pipeline-cache-ggml0190.patch  # Vulkan 持久化磁盘管线缓存（补丁五，可独立或叠加于一至四）
+│   ├── vulkan-pipeline-cache-ggml0190.patch  # Vulkan 持久化磁盘管线缓存（补丁五，可独立或叠加于一至四）
+│   └── metal-conv-direct-1d-ggml0190.patch  # Metal F32 direct convolution (6)
 ├── tests/
 │   ├── test_learned_ops.c           # 补丁一正确性冒烟测试（手写参考值对照）
 │   ├── test_qvac_ops.c              # 补丁二正确性测试（cpu | vk | metal 挂具钩子）
@@ -96,10 +105,11 @@ git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch            # �
 git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch               # 补丁二（顺序应用）
 git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch              # 补丁三（Metal，可选）
 git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # 补丁四（叠加于一+二）
-git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # 补丁五（最后应用；也可独立应用于原生 v0.19.0）
+git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # 补丁五（在补丁四之后；也可独立应用于原生 v0.19.0）
+git apply ../ggml-audio-patch/patches/metal-conv-direct-1d-ggml0190.patch   # 补丁六（需要一+二+三）
 ```
 
-补丁二必须跟在补丁一之后：两者触碰相同的枚举断言与分发代码块。非 Metal 平台可不应用补丁三。补丁四必须跟在补丁一、二之后：它消费补丁一的 `CONV_DIRECT_1D`，并与补丁二共用 shader 注册表/分发插入点（与补丁三正交——无论装不装 Metal 补丁都可同样应用）。补丁五已验证既可独立应用于原生 v0.19.0，也可叠加在补丁 1–4 之上——组合应用时**最后装**（它与补丁四都改 `src/ggml-vulkan/ggml-vulkan.cpp`）。只装补丁一可以（跳过后续）；只装一+四**不支持**。
+补丁二必须跟在补丁一之后：两者触碰相同的枚举断言与分发代码块。非 Metal 平台可不应用补丁三。补丁四必须跟在补丁一、二之后：它消费补丁一的 `CONV_DIRECT_1D`，并与补丁二共用 shader 注册表/分发插入点（与补丁三正交——无论装不装 Metal 补丁都可同样应用）。补丁五已验证既可独立应用于原生 v0.19.0，也可叠加在补丁 1–4 之上——组合应用时**在补丁四之后装**（它与补丁四都改 `src/ggml-vulkan/ggml-vulkan.cpp`）。只装补丁一可以（跳过后续）；只装一+四**不支持**。
 
 配置 / 编译 / 测试见 **[docs/building_zh.md](docs/building_zh.md)**（含 Vulkan SDK、CUDA 工具链、Windows 生成器选择等注意事项），或直接跑 `scripts/build-and-test.sh` / `build-and-test.ps1`。
 
@@ -116,7 +126,7 @@ git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # �
 | `REL_POS_BIAS` | ✅ | ✅ | —（回落 CPU） | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅（add 需 `shaderBufferFloat32AtomicAdd`） | — | — |
 | `ADD_LEAKY_RELU` | ✅ | —（回落 CPU） | — | — |
-| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | ✅ 补丁四（fp32，`K ≥ 3`，`(K−1)·dil ≤ 72`，否则回落 CPU） | — | — |
+| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | ✅ 补丁四（fp32，`K ≥ 3`，`(K−1)·dil ≤ 72`，否则回落 CPU） | — | ✅ 补丁六（F32，Apple7） |
 
 补丁二：
 

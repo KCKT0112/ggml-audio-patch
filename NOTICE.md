@@ -24,6 +24,7 @@ redistributions.
 | Ten fused ops (`SUPERTONIC_*`, `GRU`, `ZERO_UPSAMPLE`, `CHANNEL_SHUFFLE`, `AFFINE_PRELU`, `SNAKE`) | [tetherto/qvac-ext-ggml](https://github.com/tetherto/qvac-ext-ggml) (`speech` branch) | MIT | patch 2 |
 | Vulkan compute backend for `CONV_DIRECT_1D` | authored here | MPL-2.0 | patch 4 |
 | Vulkan persistent disk pipeline cache | ported from [KakaruHayate/game.cpp](https://github.com/KakaruHayate/game.cpp) | MPL-2.0 | patch 5 |
+| Metal F32 direct convolution and im2col capability alias | ported from [pc-nsf-hifigan.cpp](https://github.com/KCKT0112/pc-nsf-hifigan.cpp/commit/0abc3433b58092c7ffca0e6de54f6b70250a5393) | MIT | patch 6 |
 
 Base tree: [ggml](https://github.com/ggml-org/ggml) `30bf868` (v0.19.0) — MIT.
 

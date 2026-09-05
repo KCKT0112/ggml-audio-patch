@@ -10,11 +10,12 @@
 //                                                          non-multiple-of-16 OC, tails)
 //   6. ggml_add_leaky_relu         == add + leaky_relu   (broadcast [1,C] and rowwise [T,C] bias)
 //
-// Usage: test_learned_ops [cpu|vk]
+// Usage: test_learned_ops [cpu|vk|metal]
 // (vk builds link ggml-vulkan and run every case on device 0; cases the
 //  backend reports as unsupported are skipped - on Vulkan that is convT
 //  with p0 != 0 / d0 != 1 and scatter-add without VK_EXT_shader_atomic_float.
-//  conv_direct_1d / add_leaky_relu are CPU-only ops and skip on vk.)
+//  Direct conv runs on Vulkan with patch 4 and Metal with patch 6.
+//  add_leaky_relu remains CPU-only.)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+
+#ifdef USE_METAL
+#include "ggml-metal.h"
+#endif
 
 #ifdef USE_VULKAN
 // provided by ggml-vulkan.dll (ggml.h GGML_API decls live in the backend lib)
@@ -85,6 +90,14 @@ static void tctx_begin(struct tctx * t) {
         return;
     }
 #endif
+#ifdef USE_METAL
+    if (strcmp(g_backend, "metal") == 0) {
+        t->backend = ggml_backend_metal_init();
+        GGML_ASSERT(t->backend && "Metal initialization failed");
+        t->buft = ggml_backend_get_default_buffer_type(t->backend);
+        return;
+    }
+#endif
     t->backend = ggml_backend_cpu_init();
     t->buft = ggml_backend_cpu_buffer_type();
 }
@@ -100,6 +113,15 @@ static bool tctx_alloc_graph(struct tctx * t, struct ggml_tensor * result, struc
     ggml_build_forward_expand(t->gf, result);
     if (result2) {
         ggml_build_forward_expand(t->gf, result2);
+    }
+    // Raw graph execution cannot fall back: check intermediate nodes too.
+    for (int i = 0; i < ggml_graph_n_nodes(t->gf); ++i) {
+        struct ggml_tensor * node = ggml_graph_node(t->gf, i);
+        if (!ggml_backend_supports_op(t->backend, node)) {
+            printf("  SKIP: %s does not support graph node %s\n",
+                   g_backend, ggml_op_name(node->op));
+            return false;
+        }
     }
     t->galloc = ggml_gallocr_new(t->buft);
     if (!ggml_gallocr_alloc_graph(t->galloc, t->gf)) {
@@ -118,7 +140,8 @@ static void tctx_download(struct tctx * t, const struct ggml_tensor * tensor, vo
 }
 
 static void tctx_compute(struct tctx * t) {
-    ggml_backend_graph_compute(t->backend, t->gf);
+    enum ggml_status status = ggml_backend_graph_compute(t->backend, t->gf);
+    GGML_ASSERT(status == GGML_STATUS_SUCCESS);
 }
 
 static void tctx_end(struct tctx * t) {
@@ -468,6 +491,7 @@ static void test_conv_direct_1d(void) {
         int OC, IC, K, pad, dil;
         int bias, res, fused_io;   // case config
         float slope, in_scale, in_slope;
+        int output_length;       // 0 preserves the original CPU test lengths
     } cases[] = {
         // basic shapes, plain conv + bias
         {16,  8, 3, 1, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f},
@@ -491,13 +515,26 @@ static void test_conv_direct_1d(void) {
         {30, 13, 7, 3, 1, 1, 0, 1, 0.0f, 0.5f, 0.1f},   // scale + leaky + odd OC
         // everything at once
         {30, 13, 3, 1, 3, 1, 1, 1, 0.1f, 0.33333334f, 0.1f},
+        // Metal tile boundaries, K=1/2, scalar outputs, and time tails.
+        {1,  16, 7, 3, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f, 257},
+        {7,   5, 3, 1, 1, 0, 1, 1, 0.1f, 0.5f, 0.1f, 65},
+        {8,   5, 1, 0, 1, 1, 1, 1, 0.1f, 0.5f, 0.1f, 64},
+        {16,  8, 2, 1, 1, 1, 0, 1, 0.0f, 0.5f, 0.1f, 65},
+        {17,  9, 2, 0, 1, 0, 1, 1, 0.1f, 1.0f, 0.1f, 130},
+        {32, 13, 3, 1, 3, 1, 1, 1, 0.1f, -0.5f, 0.1f, 65},
+        {33, 13, 3, 1, 1, 1, 1, 1, 0.1f, 0.5f, 0.1f, 65},
+        {64, 16, 7, 3, 1, 1, 0, 0, 0.0f, 1.0f, 0.0f, 64},
+        {65, 13, 11, 5, 5, 1, 1, 1, 0.1f, 0.5f, 0.1f, 129},
+        {1,   1, 1, 0, 1, 0, 0, 0, 0.0f, 1.0f, 0.0f, 1},
+        {64, 16, 2, 1, 1, 1, 0, 1, 0.0f, 0.33333334f, 0.1f, 65},
+        {33, 13, 3, 20, 1, 0, 0, 1, 0.0f, 0.5f, 0.1f, 65},
     };
 
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
         const int OC = cases[c].OC, IC = cases[c].IC, K = cases[c].K;
         const int pad = cases[c].pad, dil = cases[c].dil;
         // T chosen so OL covers: multiple of 6, remainder 1, remainder 4 (partial tail)
-        const int OL_target = 25 + (int)c;
+        const int OL_target = cases[c].output_length ? cases[c].output_length : 25 + (int)c;
         const int T = OL_target + dil*(K-1) - 2*pad;
         const int OL = T + 2*pad - dil*(K-1);
         if (T <= 0) continue;
@@ -532,6 +569,12 @@ static void test_conv_direct_1d(void) {
               "shape (case %zu): got [%lld,%lld] want [%d,%d]",
               c, (long long)r->ne[0], (long long)r->ne[1], OL, OC);
 
+#ifdef USE_METAL
+        if (strcmp(g_backend, "metal") == 0 && ggml_backend_metal_supports_family(t.backend, 7)) {
+            CHECK(ggml_backend_supports_op(t.backend, r),
+                  "Metal direct-conv case %zu must execute (is patch 6 applied?)", c);
+        }
+#endif
         if (!tctx_alloc_graph(&t, r, NULL)) {
             free(pa); free(pb); free(pvb); free(prr); tctx_end(&t); continue;
         }
@@ -543,6 +586,9 @@ static void test_conv_direct_1d(void) {
 
         float * out = (float *)malloc(ggml_nbytes(r));
         tctx_download(&t, r, out);
+        for (int i = 0; i < OL*OC; ++i) {
+            CHECK(isfinite(out[i]), "non-finite direct-conv output at %d", i);
+        }
 
         float * ref = (float *)malloc((size_t)OL * OC * sizeof(float));
         ref_conv_direct_1d(pa, pb, pvb, prr, K, IC, OC, T, pad, dil,
@@ -551,6 +597,7 @@ static void test_conv_direct_1d(void) {
               "conv_direct_1d differs (case %zu: OC%d IC%d K%d p%d d%d bias%d res%d io%d)",
               c, OC, IC, K, pad, dil, cases[c].bias, cases[c].res, cases[c].fused_io);
 
+        printf("  case %zu: OC=%d IC=%d K=%d OL=%d checked\n", c, OC, IC, K, OL);
         free(pa); free(pb); free(pvb); free(prr); free(out); free(ref);
         tctx_end(&t);
     }
@@ -626,9 +673,60 @@ static void test_add_leaky_relu(void) {
     printf("  done (%d failures so far)\n", failures);
 }
 
+#ifdef USE_METAL
+static void test_metal_direct_conv_gates(void) {
+    if (strcmp(g_backend, "metal") != 0) return;
+    printf("[test] Metal direct-conv supports_op rejection cases\n");
+    struct tctx t;
+    tctx_begin(&t);
+    struct ggml_tensor * w = ggml_new_tensor_3d(t.ctx, GGML_TYPE_F32, 3, 5, 33);
+    struct ggml_tensor * x = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 65, 5);
+    struct ggml_tensor * b = ggml_new_tensor_1d(t.ctx, GGML_TYPE_F32, 33);
+    struct ggml_tensor * res = ggml_new_tensor_2d(t.ctx, GGML_TYPE_F32, 65, 33);
+    struct ggml_tensor * y = ggml_conv_direct_1d_fused(t.ctx, w, x, b, res, 1, 1, 0.1f, 0.5f, 0.1f);
+    CHECK(ggml_backend_supports_op(t.backend, y) == ggml_backend_metal_supports_family(t.backend, 7),
+          "direct-conv must follow the Apple7 capability gate");
+    w->type = GGML_TYPE_F16;
+    CHECK(!ggml_backend_supports_op(t.backend, y), "F16 weight accepted");
+    w->type = GGML_TYPE_F32;
+    w->nb[1] += sizeof(float);
+    CHECK(!ggml_backend_supports_op(t.backend, y), "strided weight accepted");
+    w->nb[1] -= sizeof(float);
+    x->ne[2] = 2;
+    CHECK(!ggml_backend_supports_op(t.backend, y), "batched input accepted");
+    x->ne[2] = 1;
+    b->ne[0] = 32;
+    CHECK(!ggml_backend_supports_op(t.backend, y), "wrong bias length accepted");
+    b->ne[0] = 33;
+    res->ne[0] = 64;
+    CHECK(!ggml_backend_supports_op(t.backend, y), "wrong residual shape accepted");
+    res->ne[0] = 65;
+    y->op_params[0] = -1;
+    CHECK(!ggml_backend_supports_op(t.backend, y), "negative padding accepted");
+    y->op_params[0] = 1;
+    y->op_params[1] = 0;
+    CHECK(!ggml_backend_supports_op(t.backend, y), "zero dilation accepted");
+    y->op_params[1] = 1;
+    y->ne[0] = 64;
+    CHECK(!ggml_backend_supports_op(t.backend, y), "wrong output length accepted");
+    tctx_end(&t);
+}
+#endif
+
 int main(int argc, char ** argv) {
     if (argc > 1) {
         g_backend = argv[1];
+    }
+    if (strcmp(g_backend, "cpu") != 0
+#ifdef USE_VULKAN
+        && strcmp(g_backend, "vk") != 0
+#endif
+#ifdef USE_METAL
+        && strcmp(g_backend, "metal") != 0
+#endif
+    ) {
+        fprintf(stderr, "Backend '%s' is not enabled in this test build\n", g_backend);
+        return 1;
     }
     printf("== learned-ops smoke tests (backend: %s) ==\n", g_backend);
 
@@ -638,6 +736,9 @@ int main(int argc, char ** argv) {
     test_rel_pos_bias();
     test_conv_direct_1d();
     test_add_leaky_relu();
+#ifdef USE_METAL
+    test_metal_direct_conv_gates();
+#endif
 
     if (failures == 0) {
         printf("\nALL PASSED\n");

@@ -23,11 +23,23 @@ git checkout 30bf868                       # v0.19.0
 git apply <path-to>/patches/learned-ops-ggml0190.patch   # patch 1 (required)
 git apply <path-to>/patches/qvac-ops-ggml0190.patch      # patch 2 (optional, sequential)
 git apply <path-to>/patches/metal-ops-ggml0190.patch     # patch 3 (optional Metal integration)
+git apply <path-to>/patches/vulkan-conv-direct-1d-ggml0190.patch  # 4
+git apply <path-to>/patches/vulkan-pipeline-cache-ggml0190.patch  # 5
+git apply <path-to>/patches/metal-conv-direct-1d-ggml0190.patch   # 6 (Metal)
 ```
 
 Patch 2 must be applied **after** patch 1 (they touch the same enum-assert and dispatch hunks), and patch 3 must follow patch 2. Applying only patch 1 is fine; patch 2 and patch 3 cannot be applied independently of their predecessors.
 
 All further `cmake -S <dir>` commands below point at this patched tree.
+
+Patch 6 requires patches 1, 2 and 3. Metal-only order is 1 → 2 → 3 → 6; the full stack is 1 → 2 → 3 → 4 → 5 → 6. From this repository, build and test CPU/Metal with:
+
+```bash
+GGML_SRC=../ggml-src bash scripts/build-and-test-metal.sh
+```
+
+The script embeds shader source, runs both CPU/Metal suites, and repeats Metal tests. See [Metal direct convolution](metal-direct-conv.md) for capability gates and raw-graph fallback requirements.
+
 
 ## 2. CPU-only build
 

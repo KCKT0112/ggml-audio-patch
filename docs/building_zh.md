@@ -23,11 +23,23 @@ git checkout 30bf868                       # v0.19.0
 git apply <本仓库路径>/patches/learned-ops-ggml0190.patch   # 补丁一（必需）
 git apply <本仓库路径>/patches/qvac-ops-ggml0190.patch      # 补丁二（可选，顺序应用）
 git apply <本仓库路径>/patches/metal-ops-ggml0190.patch     # 补丁三（可选 Metal 集成）
+git apply <本仓库路径>/patches/vulkan-conv-direct-1d-ggml0190.patch  # 4
+git apply <本仓库路径>/patches/vulkan-pipeline-cache-ggml0190.patch  # 5
+git apply <本仓库路径>/patches/metal-conv-direct-1d-ggml0190.patch   # 6 (Metal)
 ```
 
 补丁二必须**在补丁一之后**应用（两者触碰相同的枚举断言与分发代码块），补丁三必须跟在补丁二之后。只用补丁一完全可行；补丁二或补丁三都不能脱离前序补丁单独使用。
 
 下文中所有 `cmake -S <dir>` 都指向这份打过 patch 的源码树。
+
+补丁六需要一、二、三；只用 Metal 可按 1 → 2 → 3 → 6 应用，完整集合按 1 → 2 → 3 → 4 → 5 → 6。Metal 构建与 CPU/GPU 回归可在本仓库目录执行：
+
+```bash
+GGML_SRC=../ggml-src bash scripts/build-and-test-metal.sh
+```
+
+脚本启用嵌入 shader，运行两套 CPU/Metal 测试并重复 Metal 测试。GPU 能力门控和直接执行图的回退要求见 [Metal 直接卷积](metal-direct-conv_zh.md)。
+
 
 ## 2. CPU-only 构建
 

@@ -1,0 +1,418 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 2219076..faa2934 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -634,7 +634,7 @@ extern "C" {
+         // Fused stride-1 direct 1D convolution (HiFiGAN vocoder): packs the
+         // kernel to [IC*K, OC] once per call and runs AVX2-blocked output
+         // tiles without materializing an im2col buffer; optional bias add +
+-        // leaky ReLU in the epilogue.  CPU only.
++        // leaky ReLU in the epilogue.  CPU; Vulkan/Metal via backend patches.
+         GGML_OP_CONV_DIRECT_1D,
+ 
+         GGML_OP_COUNT,
+@@ -2785,7 +2785,7 @@ extern "C" {
+     //   x:    [T, IC] contiguous F32
+     //   bias: [OC] F32 or NULL
+     //   out:  [OL, OC] with OL = T + 2*pad - dil*(K-1)
+-    // CPU only; other backends never emit the op.
++    // CPU; Vulkan/Metal via backend patches. Check backend supports_op before use.
+     GGML_API struct ggml_tensor * ggml_conv_direct_1d(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * w,      // [K, IC, OC]
+@@ -2795,7 +2795,7 @@ extern "C" {
+             int                   dil,
+             float                 leaky_slope);   // 0 = no activation
+ 
+-    // fused variant with two extra producer-side fusions (CPU only):
++    // fused variant with two extra producer-side fusions (CPU/Vulkan/Metal):
+     //   res:       [OL, OC] contiguous or NULL; when set the epilogue adds it
+     //              (out = (bias + acc) + res, the same association as
+     //              ggml_add(conv_out, res)) replacing a separate ADD node.
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 8b000d6..29b19f5 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -1841,6 +1841,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_direct_1d(ggml_metal_library_t lib, const ggml_tensor * op) {
++    assert(op->op == GGML_OP_CONV_DIRECT_1D);
++
++    const int64_t OC = op->ne[1];
++    const char * base = OC < 8 ? "kernel_conv_direct_1d_f32_scalar"
++                      : OC <= 16 ? "kernel_conv_direct_1d_f32_16x64"
++                      : OC <= 32 ? "kernel_conv_direct_1d_f32_32x64"
++                                 : "kernel_conv_direct_1d_f32_64x64";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
++    }
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d(ggml_metal_library_t lib, const ggml_tensor * op) {
+     assert(op->op == GGML_OP_CONV_TRANSPOSE_1D);
+ 
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index b4884bd..e7cb146 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -155,6 +155,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d         (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_direct_1d    (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_snake             (ggml_metal_library_t lib, enum ggml_type type);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_supertonic_depthwise_1d    (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_supertonic_layer_norm_channel(ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
+index 0b14320..f1e9e91 100644
+--- a/src/ggml-metal/ggml-metal-device.m
++++ b/src/ggml-metal/ggml-metal-device.m
+@@ -1239,7 +1239,48 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+         case GGML_OP_ROPE_BACK:
+             return true;
+         case GGML_OP_IM2COL:
++        case GGML_OP_IM2COL_FAST_1D:
+             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
++        case GGML_OP_CONV_DIRECT_1D:
++            {
++                const struct ggml_tensor * w    = op->src[0];
++                const struct ggml_tensor * x    = op->src[1];
++                const struct ggml_tensor * bias = op->src[2];
++                const struct ggml_tensor * res  = op->src[3];
++                if (!has_simdgroup_mm || w == NULL || x == NULL ||
++                    w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
++                    op->type != GGML_TYPE_F32 ||
++                    !ggml_is_contiguous(w) || !ggml_is_contiguous(x) ||
++                    !ggml_is_contiguous(op)) {
++                    return false;
++                }
++                // The shader addresses a single [T, IC] input / [OL, OC]
++                // output with 32-bit indices. Do not silently accept batches.
++                if (w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
++                    op->ne[2] != 1 || op->ne[3] != 1 ||
++                    w->ne[1] != x->ne[1] || w->ne[2] != op->ne[1] ||
++                    ggml_nelements(w) <= 0 || ggml_nelements(w) > INT32_MAX ||
++                    ggml_nelements(x) <= 0 || ggml_nelements(x) > INT32_MAX ||
++                    ggml_nelements(op) <= 0 || ggml_nelements(op) > INT32_MAX) {
++                    return false;
++                }
++                if (bias != NULL && (bias->type != GGML_TYPE_F32 ||
++                                     !ggml_is_contiguous(bias) ||
++                                     ggml_nelements(bias) != op->ne[1])) {
++                    return false;
++                }
++                if (res != NULL && (res->type != GGML_TYPE_F32 ||
++                                    !ggml_is_contiguous(res) ||
++                                    !ggml_are_same_shape(res, op))) {
++                    return false;
++                }
++                const int32_t pad = ggml_get_op_params_i32(op, 0);
++                const int32_t dil = ggml_get_op_params_i32(op, 1);
++                return pad >= 0 && dil >= 1 &&
++                       x->ne[0] + 2*(int64_t)pad <= INT32_MAX &&
++                       op->ne[0] + (int64_t)dil*(w->ne[0] - 1) <= INT32_MAX &&
++                       op->ne[0] == x->ne[0] + 2*(int64_t)pad - (int64_t)dil*(w->ne[0] - 1);
++            }
+         case GGML_OP_CONV_2D:
+             return ggml_is_contiguous(op->src[0]) &&
+                    op->src[1]->type == GGML_TYPE_F32 &&
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index 2dcbf4e..14c9fdd 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -623,6 +623,25 @@ typedef struct {
+     int32_t  p0;
+ } ggml_metal_kargs_col2im_1d;
+ 
++// Fused implicit-GEMM stride-1 convolution used by HiFiGAN.  The op owns the
++// exact same parameter contract as GGML_OP_CONV_DIRECT_1D on CPU/Vulkan; the
++// Metal kernels select a simdgroup-matrix tile for OC >= 8 and a streaming
++// scalar kernel for narrow outputs (notably conv_post with OC == 1).
++typedef struct {
++    int32_t T;
++    int32_t OL;
++    int32_t IC;
++    int32_t OC;
++    int32_t K;
++    int32_t pad;
++    int32_t dil;
++    int32_t has_bias;
++    int32_t has_res;
++    float   slope;
++    float   in_scale;
++    float   in_slope;
++} ggml_metal_kargs_conv_direct_1d;
++
+ typedef struct {
+     int32_t T;
+     int32_t C;
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index d3a93b4..8667d7f 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -398,6 +398,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_im2col(ctx, idx);
+             } break;
++        case GGML_OP_CONV_DIRECT_1D:
++            {
++                n_fuse = ggml_metal_op_conv_direct_1d(ctx, idx);
++            } break;
+         case GGML_OP_CONV_2D:
+             {
+                 n_fuse = ggml_metal_op_conv_2d(ctx, idx);
+@@ -4035,6 +4039,67 @@ int ggml_metal_op_im2col(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_conv_direct_1d(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    const int32_t * params = (const int32_t *) op->op_params;
++    float slope;
++    float in_scale;
++    float in_slope;
++    memcpy(&slope,    &params[2], sizeof(float));
++    memcpy(&in_scale, &params[4], sizeof(float));
++    memcpy(&in_slope, &params[5], sizeof(float));
++
++    ggml_metal_kargs_conv_direct_1d args = {
++        /*.T         =*/ (int32_t) op->src[1]->ne[0],
++        /*.OL        =*/ (int32_t) op->ne[0],
++        /*.IC        =*/ (int32_t) op->src[1]->ne[1],
++        /*.OC        =*/ (int32_t) op->ne[1],
++        /*.K         =*/ (int32_t) op->src[0]->ne[0],
++        /*.pad       =*/ params[0],
++        /*.dil       =*/ params[1],
++        /*.has_bias  =*/ params[3],
++        /*.has_res   =*/ params[6],
++        /*.slope     =*/ slope,
++        /*.in_scale  =*/ in_scale,
++        /*.in_slope  =*/ in_slope,
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_conv_direct_1d(lib, op);
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2] ? op->src[2] : op->src[0]), 3);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3] ? op->src[3] : op->src[0]), 4);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 5);
++
++    if (args.OC < 8) {
++        constexpr uint64_t nth = 256;
++        ggml_metal_encoder_dispatch_threadgroups(enc, (args.OL + nth - 1)/nth, args.OC, 1,
++                                                  nth, 1, 1);
++    } else {
++        constexpr uint64_t tile_k = 8;
++        const uint64_t tile_oc = args.OC <= 16 ? 16 : (args.OC <= 32 ? 32 : 64);
++        constexpr uint64_t tile_t = 64;
++        const uint64_t nth = (tile_oc/8)*32;
++        const size_t stage_elems = tile_oc*tile_k + tile_k*tile_t;
++        const size_t spill_elems = tile_oc*tile_t;
++        const size_t smem = std::max(stage_elems, spill_elems)*sizeof(float);
++        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
++        ggml_metal_encoder_dispatch_threadgroups(enc,
++                                                  (args.OL + tile_t - 1)/tile_t,
++                                                  (args.OC + tile_oc - 1)/tile_oc, 1,
++                                                  nth, 1, 1);
++    }
++
++    return 1;
++}
++
+ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/src/ggml-metal/ggml-metal-ops.h b/src/ggml-metal/ggml-metal-ops.h
+index af098e3..663b275 100644
+--- a/src/ggml-metal/ggml-metal-ops.h
++++ b/src/ggml-metal/ggml-metal-ops.h
+@@ -84,6 +84,7 @@ int ggml_metal_op_conv_3d           (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_conv_transpose_1d (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_conv_transpose_2d (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_col2im_1d         (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_conv_direct_1d    (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_snake_fused       (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_snake             (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_supertonic_depthwise_1d    (ggml_metal_op_t ctx, int idx);
+diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
+index 802e2cd..13134f2 100644
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -4944,6 +4944,165 @@ kernel void kernel_im2col(
+ template [[host_name("kernel_im2col_f32")]] kernel im2col_t kernel_im2col<float>;
+ template [[host_name("kernel_im2col_f16")]] kernel im2col_t kernel_im2col<half>;
+ 
++// Fused HiFiGAN stride-1 direct convolution.  The matrix variant computes an
++// [OC_TILE x T_TILE] output tile as W[OC,K*IC] * implicit_im2col(X)[K*IC,T].
++// One threadgroup shares every gathered X value across its output-channel tile,
++// avoiding both the multi-gigabyte im2col traffic and the standalone bias,
++// residual, scale and leaky-ReLU kernels in the original graph.
++template <ushort OC_TILE, ushort T_TILE, ushort K_TILE, ushort NSG>
++kernel void kernel_conv_direct_1d_matrix(
++        constant ggml_metal_kargs_conv_direct_1d & args,
++        device const float * w,
++        device const float * x,
++        device const float * bias,
++        device const float * res,
++        device       float * dst,
++        threadgroup  float * shmem [[threadgroup(0)]],
++        uint2 tgpig [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    constexpr ushort NTH = NSG*32;
++    constexpr ushort ROW_BLOCKS = OC_TILE/(NSG*8);
++    constexpr ushort COL_BLOCKS = T_TILE/8;
++
++    const uint t0  = tgpig.x*T_TILE;
++    const uint oc0 = tgpig.y*OC_TILE;
++    const uint KIC = args.K*args.IC;
++
++    threadgroup float * sa = shmem;
++    threadgroup float * sb = sa + OC_TILE*K_TILE;
++    // Once the K loop completes sa/sb are dead.  Reuse that storage for the
++    // accumulator spill instead of reserving a disjoint output tile; this
++    // cuts the 64x64 variant from 20 KiB to 16 KiB of shared memory.
++    threadgroup float * sc = shmem;
++
++    simdgroup_float8x8 acc[ROW_BLOCKS*COL_BLOCKS];
++    for (ushort i = 0; i < ROW_BLOCKS*COL_BLOCKS; ++i) {
++        acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
++    }
++
++    for (uint k0 = 0; k0 < KIC; k0 += K_TILE) {
++        // W tile: [OC_TILE, K_TILE], contiguous in flattened (ic, kw) order.
++        for (uint idx = tid; idx < OC_TILE*K_TILE; idx += NTH) {
++            const uint o = idx/K_TILE;
++            const uint kk = idx - o*K_TILE;
++            const uint oc = oc0 + o;
++            const uint q = k0 + kk;
++            sa[idx] = oc < (uint)args.OC && q < KIC ? w[oc*KIC + q] : 0.0f;
++        }
++
++        // Implicit im2col tile: [K_TILE, T_TILE].  Threads walk contiguous time
++        // positions, so every (ic,kw) input row is a coalesced read.
++        for (uint idx = tid; idx < K_TILE*T_TILE; idx += NTH) {
++            const uint kk = idx/T_TILE;
++            const uint jt = idx - kk*T_TILE;
++            const uint q = k0 + kk;
++            const uint t = t0 + jt;
++            float v = 0.0f;
++            if (q < KIC && t < (uint)args.OL) {
++                const uint ic = q/(uint)args.K;
++                const uint kw = q - ic*(uint)args.K;
++                const int it = (int)t + (int)kw*args.dil - args.pad;
++                if (it >= 0 && it < args.T) {
++                    v = x[ic*(uint)args.T + (uint)it] * args.in_scale;
++                    if (args.in_slope != 0.0f && v < 0.0f) {
++                        v *= args.in_slope;
++                    }
++                }
++            }
++            sb[idx] = v;
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        for (ushort kb = 0; kb < K_TILE/8; ++kb) {
++            simdgroup_float8x8 ma[ROW_BLOCKS];
++            simdgroup_float8x8 mb[COL_BLOCKS];
++            for (ushort r = 0; r < ROW_BLOCKS; ++r) {
++                simdgroup_load(ma[r], sa + (sgitg*ROW_BLOCKS + r)*8*K_TILE + kb*8,
++                               K_TILE, 0, false);
++            }
++            for (ushort c = 0; c < COL_BLOCKS; ++c) {
++                simdgroup_load(mb[c], sb + kb*8*T_TILE + c*8, T_TILE, 0, false);
++            }
++            for (ushort r = 0; r < ROW_BLOCKS; ++r) {
++                for (ushort c = 0; c < COL_BLOCKS; ++c) {
++                    const ushort i = r*COL_BLOCKS + c;
++                    simdgroup_multiply_accumulate(acc[i], ma[r], mb[c], acc[i]);
++                }
++            }
++        }
++
++        // sa/sb are reused by the next K tile; every simdgroup must finish
++        // consuming them before any thread starts overwriting the buffers.
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    for (ushort r = 0; r < ROW_BLOCKS; ++r) {
++        for (ushort c = 0; c < COL_BLOCKS; ++c) {
++            simdgroup_store(acc[r*COL_BLOCKS + c],
++                            sc + (sgitg*ROW_BLOCKS + r)*8*T_TILE + c*8,
++                            T_TILE, 0, false);
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    // Fused epilogue and guarded edge store.
++    for (uint idx = tid; idx < OC_TILE*T_TILE; idx += NTH) {
++        const uint o = idx/T_TILE;
++        const uint jt = idx - o*T_TILE;
++        const uint oc = oc0 + o;
++        const uint t = t0 + jt;
++        if (oc < (uint)args.OC && t < (uint)args.OL) {
++            const uint di = oc*(uint)args.OL + t;
++            float v = sc[idx];
++            if (args.has_bias) v += bias[oc];
++            if (args.has_res)  v += res[di];
++            if (args.slope != 0.0f && v < 0.0f) v *= args.slope;
++            dst[di] = v;
++        }
++    }
++}
++
++typedef decltype(kernel_conv_direct_1d_matrix<16, 64, 8, 2>) kernel_conv_direct_1d_matrix_t;
++
++template [[host_name("kernel_conv_direct_1d_f32_16x64")]] kernel kernel_conv_direct_1d_matrix_t kernel_conv_direct_1d_matrix<16,  64, 8, 2>;
++template [[host_name("kernel_conv_direct_1d_f32_32x64")]] kernel kernel_conv_direct_1d_matrix_t kernel_conv_direct_1d_matrix<32,  64, 8, 4>;
++template [[host_name("kernel_conv_direct_1d_f32_64x64")]] kernel kernel_conv_direct_1d_matrix_t kernel_conv_direct_1d_matrix<64,  64, 8, 8>;
++
++// Narrow-output path (conv_post is OC=1): one coalesced thread per time
++// position avoids paying for seven empty rows of an 8x8 matrix tile.
++kernel void kernel_conv_direct_1d_f32_scalar(
++        constant ggml_metal_kargs_conv_direct_1d & args,
++        device const float * w,
++        device const float * x,
++        device const float * bias,
++        device const float * res,
++        device       float * dst,
++        uint2 tgpig [[threadgroup_position_in_grid]],
++        ushort tid [[thread_index_in_threadgroup]]) {
++    const uint t = tgpig.x*256 + tid;
++    const uint oc = tgpig.y;
++    if (t >= (uint)args.OL || oc >= (uint)args.OC) return;
++
++    float sum = 0.0f;
++    for (uint ic = 0; ic < (uint)args.IC; ++ic) {
++        for (uint kw = 0; kw < (uint)args.K; ++kw) {
++            const int it = (int)t + (int)kw*args.dil - args.pad;
++            if (it >= 0 && it < args.T) {
++                float v = x[ic*(uint)args.T + (uint)it] * args.in_scale;
++                if (args.in_slope != 0.0f && v < 0.0f) v *= args.in_slope;
++                sum = fma(w[(oc*(uint)args.IC + ic)*(uint)args.K + kw], v, sum);
++            }
++        }
++    }
++    const uint di = oc*(uint)args.OL + t;
++    if (args.has_bias) sum += bias[oc];
++    if (args.has_res)  sum += res[di];
++    if (args.slope != 0.0f && sum < 0.0f) sum *= args.slope;
++    dst[di] = sum;
++}
++
+ // TODO: optimize
+ typedef void (im2col_ext_t)(
+         constant ggml_metal_kargs_im2col & args,

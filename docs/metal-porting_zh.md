@@ -2,6 +2,8 @@
 
 > 中文 | **[English](metal-porting.md)**
 
+补丁六新增 HiFiGAN 的 F32 直接卷积与 `IM2COL_FAST_1D` 能力别名。应用顺序、29 例直接卷积测试、Apple7 门控和历史速度数据见 [Metal 直接卷积](metal-direct-conv_zh.md)。下文保留补丁三的原有验证记录。
+
 可选补丁三（`patches/metal-ops-ggml0190.patch`）接入了 Metal 后端的哪些内容、测试挂具怎么跑、维护时需要知道的坑，以及已验证交付。贡献者（人类或 agent）的编辑边界见 [/AGENTS.md](../AGENTS.md)。本轮如何在没有本地苹果硬件的情况下打包并下发这项任务，记录在 [task-package_zh.md](task-package_zh.md)。
 
 ## 当前状态

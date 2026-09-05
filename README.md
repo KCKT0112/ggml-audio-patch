@@ -2,7 +2,7 @@
 
 > **[中文文档](README_CN.md)** | English
 
-A curated patch set that ports **sixteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0** — fourteen adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends; plus two authored here for the NSF-HiFiGAN vocoder (a fused bias-add + leaky-ReLU, and a stride-1 direct 1-D convolution with producer-side fusions). Shipped as five unified diffs (applied in sequence; the Metal one is platform-optional, the last one is a Vulkan pipeline-cache enhancement with no operator content) plus correctness tests and cross-backend benchmark suites.
+A curated patch set that ports **sixteen audio-domain operators** into [ggml](https://github.com/ggml-org/ggml) **v0.19.0** — fourteen adopted from different projects in the ggml ecosystem, unified to upstream-conformant APIs, fixed where the originals were broken, and extended across CPU / Vulkan / CUDA / Metal backends; plus two authored here for the NSF-HiFiGAN vocoder (a fused bias-add + leaky-ReLU, and a stride-1 direct 1-D convolution with producer-side fusions). Shipped as six unified diffs (applied in sequence; Metal patches 3/6 are platform-optional, patch 5 is a Vulkan pipeline-cache enhancement) plus correctness tests and cross-backend benchmark suites.
 
 ## Patch 1 — the six learned operators
 
@@ -57,6 +57,14 @@ Ports [KakaruHayate/game.cpp](https://github.com/KakaruHayate/game.cpp) (`cmake/
 - Measured (2026-08-30, Windows 11, Xeon E5-2675 v3, RTX 2070 driver 32.0.16.2002, MSVC 14.29, pc-nsf-hifigan.cpp `hifigan_cli`, reference clip T=1722, blob = 334 150 B): with the cache blob absent the first run of the patched binary pays pipeline compilation **inside** the first compute — 1 061.5 ms in-graph / 2 454 ms process wall; subsequent process restarts with the warm blob run 346.8–355.0 ms in-graph / ≈1 120–1 290 ms wall. First-run cost reduced ≈3× in-graph, ≈2× wall.
 - Honesty note: on this test box the NVIDIA driver's own shader cache (…/NVIDIA/GLCache) also persists compiled pipelines across process restarts, and with that cache hot the blob adds nothing measurable in steady state (interleaved ON/OFF medians 374.0 vs 373.1 ms, n=3, machine scatter ±10%). The blob's value shows when the driver cache is cold or evicted — first run after a driver update/reinstall or cache cleanup, capped-cache configurations, and drivers/platforms with weaker caching. Repro commands and the full run table in [docs/benchmarks.md](docs/benchmarks.md#patch-5-vulkan-pipeline-cache).
 
+## Patch 6 — Metal F32 fused direct convolution
+
+Adds Metal implicit-GEMM `CONV_DIRECT_1D` / `_fused`: `16×64`, `32×64`, `64×64` simdgroup-matrix tiles and a scalar path for `OC < 8`. Bias, residual, input scale/leaky and output leaky are fused, removing the im2col intermediates. Also fixes the missing Metal capability declaration for `IM2COL_FAST_1D`.
+
+Apply **1 → 2 → 3 → 6**, or the full **1 → 2 → 3 → 4 → 5 → 6** stack. CPU/Vulkan/CUDA kernels and public operator semantics are unchanged. Metal requires F32, contiguous single-sequence tensors and Apple7 simdgroup-matrix support. Raw-graph consumers must query `supports_op` and use their original graph or scheduler fallback on unsupported devices/shapes.
+
+See [Metal direct convolution](docs/metal-direct-conv.md) for measurements and reproduction: the 2026-08-31 Apple M4 vocoder run produced 19.992 s of audio in 0.823–0.836 s in the fastest stable series; a nearby-time comparison with ORT CPU measured 1.221 s versus 3.156 s. Collection-level CPU/Metal operator tests were rebuilt and verified on 2026-09-05. Other Apple devices have not been tested.
+
 Base tree: ggml [`30bf868`](https://github.com/ggml-org/ggml) (v0.19.0). The diffs are additive at enum/builder/kernel insertion points, so applying onto nearby commits usually needs only light conflict resolution.
 
 ## Repository layout
@@ -68,7 +76,8 @@ ggml-audio-patch/
 │   ├── qvac-ops-ggml0190.patch      # unified diff on top of patch 1 (patch 2)
 │   ├── metal-ops-ggml0190.patch     # Metal integration on top of patch 2 (patch 3)
 │   ├── vulkan-conv-direct-1d-ggml0190.patch  # Vulkan backend for CONV_DIRECT_1D (patch 4, on top of 1+2)
-│   └── vulkan-pipeline-cache-ggml0190.patch  # Vulkan persistent disk pipeline cache (patch 5, standalone or on top of 1–4)
+│   ├── vulkan-pipeline-cache-ggml0190.patch  # Vulkan persistent disk pipeline cache (patch 5, standalone or on top of 1–4)
+│   └── metal-conv-direct-1d-ggml0190.patch  # Metal F32 direct convolution (6)
 ├── tests/
 │   ├── test_learned_ops.c           # patch-1 correctness smoke tests (hand-computed references)
 │   ├── test_qvac_ops.c              # patch-2 correctness smoke tests (cpu | vk | metal harness hook)
@@ -96,10 +105,11 @@ git apply ../ggml-audio-patch/patches/learned-ops-ggml0190.patch            # pa
 git apply ../ggml-audio-patch/patches/qvac-ops-ggml0190.patch               # patch 2 (sequential, on top)
 git apply ../ggml-audio-patch/patches/metal-ops-ggml0190.patch              # patch 3 (Metal, optional)
 git apply ../ggml-audio-patch/patches/vulkan-conv-direct-1d-ggml0190.patch  # patch 4 (on top of 1+2)
-git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # patch 5 (last; also applies standalone on stock v0.19.0)
+git apply ../ggml-audio-patch/patches/vulkan-pipeline-cache-ggml0190.patch  # patch 5 (after patch 4; also applies standalone on stock v0.19.0)
+git apply ../ggml-audio-patch/patches/metal-conv-direct-1d-ggml0190.patch   # patch 6 (requires 1+2+3)
 ```
 
-Patch 2 must follow patch 1: they touch the same enum-assert and dispatch hunks. Patch 3 is optional on non-Metal platforms. Patch 4 must follow patches 1 and 2: it consumes `CONV_DIRECT_1D` from patch 1 and shares shader-registry/dispatch insertion points with patch 2 (it is orthogonal to patch 3 — apply it with or without the Metal patch). Patch 5 was verified both standalone on stock v0.19.0 and on top of patches 1–4 — when combined, apply it **last** (it and patch 4 both edit `src/ggml-vulkan/ggml-vulkan.cpp`). Applying only patch 1 is fine (skip the rest); applying only 1+4 is **not** supported.
+Patch 2 must follow patch 1: they touch the same enum-assert and dispatch hunks. Patch 3 is optional on non-Metal platforms. Patch 4 must follow patches 1 and 2: it consumes `CONV_DIRECT_1D` from patch 1 and shares shader-registry/dispatch insertion points with patch 2 (it is orthogonal to patch 3 — apply it with or without the Metal patch). Patch 5 was verified both standalone on stock v0.19.0 and on top of patches 1–4 — when combined, apply it **after patch 4** (it and patch 4 both edit `src/ggml-vulkan/ggml-vulkan.cpp`). Applying only patch 1 is fine (skip the rest); applying only 1+4 is **not** supported.
 
 Then configure / build / test — see **[docs/building.md](docs/building.md)** for prerequisites (Vulkan SDK, CUDA toolkit, Windows generator choice) and per-backend commands, or run the bundled `scripts/build-and-test.sh` / `build-and-test.ps1`.
 
@@ -116,7 +126,7 @@ Patch 1:
 | `REL_POS_BIAS` | ✅ | ✅ | — falls back to CPU | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅ (`add` needs `shaderBufferFloat32AtomicAdd`) | — | — |
 | `ADD_LEAKY_RELU` | ✅ | — falls back to CPU | — | — |
-| `CONV_DIRECT_1D` (+`_fused`) | ✅ | ✅ patch 4 (fp32, `K ≥ 3`, `(K−1)·dil ≤ 72`; else CPU fallback) | — | — |
+| `CONV_DIRECT_1D` (+`_fused`) | ✅ | ✅ patch 4 (fp32, `K ≥ 3`, `(K−1)·dil ≤ 72`; else CPU fallback) | — | ✅ patch 6 (F32, Apple7) |
 
 Patch 2:
 

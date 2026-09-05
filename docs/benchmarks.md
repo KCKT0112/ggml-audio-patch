@@ -357,3 +357,7 @@ Precision gate (both raw outputs vs torch-CPU golden, offset-aligned): corr 0.99
 4. Attempts to force a controlled driver-cache-cold A/B were inconclusive: wiping `NVIDIA/DXCache` (2 286 files, 10.2 GB) was confirmed empty afterwards; the `NVIDIA/GLCache` entries holding this app's compiled shaders (80 files / 38 MB, incl. a 5.6 MB pair written during the first sequence) were present in one listing and gone at the next **without an intervening explicit wipe** (driver/service self-management), while steady-state timings did not reset to the cold-run level but per-run scatter grew to ±90 ms. We therefore claim a driver-cold benefit only from the genuine first-run observation (row 1 of the first table).
 
 Repro (from the consumer work directory): `Remove-Item $env:LOCALAPPDATA\ggml_audio_vk_pipeline.cache; $env:GGML_VK_PIPELINE_CACHE_DEBUG=1; $env:PCNSF_TIMING=1; hifigan_cli.exe hifigan_f32.gguf mel.bin f0.bin out.wav` then rerun without deleting the blob; A/B steady-state with `$env:GGML_VK_DISABLE_PIPELINE_CACHE=1`.
+
+## Patch 6: Metal direct convolution
+
+See [Metal direct convolution](metal-direct-conv.md#historical-vocoder-measurements-2026-08-31) for the 2026-08-31 Apple M4 full-model measurements and 2026-09-05 collection test record. It preserves the fastest stable series, later variation, nearby-time ORT CPU comparison, and user-run long sample separately, without cross-machine speedup claims.

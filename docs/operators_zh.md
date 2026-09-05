@@ -168,7 +168,7 @@ struct ggml_tensor * ggml_conv_direct_1d_fused(  // + 残差、输入侧折入
 - **阶段 1** 把 `Wᵀ` 打包成 `[IC·K, OCp]` 分块布局（`OCp` = OC 向上取整到 16），bias 零填充到 `[OCp]`，把 `x` 拷成 `[IC, T+2·pad]` scratch、两侧边界 `memset` 清零——阶段 2 完全不携带边界判断。生产侧输入折入在此逐元素完成一次。
 - **阶段 2** 每线程认领一段均衡的 6 宽 t-block。超级块（oc-超级 × t-超级，按 X 切片 ≤ 64 KB、Wt 切片 ≤ 128 KB 定尺）让两个操作数驻留 L2/L3，X 与 Wt 每次调用大约只从内存流一遍。AVX2 微内核为 6×16 tile（每步 `(ic, kw)` 12 条 FMA + 6 次广播），采用**指针递增寻址**：朴素的循环计数器 `imul` 地址链（`inc → movsxd → imul`，每 tap 约 5 个串行周期）实测会把广播分发卡到 1 FMA/cycle 以下；改成 `xp += dil, wp += OCp` 后单线程从 24.6 提到 31.8 GF/s（+26%，Xeon E5-2675 v3）。标量路径处理尾部 t-block 与非 AVX2 构建。
 
-**后端**：设计上仅 CPU——Vulkan 上 GEMM 更强、保留 im2col 路径；其他后端 `supports_op` 拒绝 → 回落 CPU。
+**后端**：CPU（补丁一）、Vulkan（补丁四）、Metal（补丁六）；各后端的设备/形状限制见下表。Metal 采用 F32 implicit GEMM，保持输入 `leaky(x * in_scale)` 和输出融合顺序；跨后端浮点累加不保证逐位一致。接入与测试见 [Metal 直接卷积](metal-direct-conv_zh.md)。
 
 **实测**（Xeon E5-2675 v3，16C/32T Haswell-EP，AVX2 负载 ~2.0 GHz，MSVC 2019 `/O2`，fp32，24 线程，3 次取中位；挂具 pc-nsf-hifigan.cpp @ `f8c16ba`）：NSF-HiFiGAN 全量推理 80 002 ms（原生 im2col + `mul_mat`）→ **28 030 ms**（direct + 生产侧融合），**2.85×**，对 torch-CPU fp32 输出 corr 0.99999999 / max|Δ| 1.49e-4——与 im2col 路径精度同级（仅 FMA 排序噪声）。融合从 252 节点中去掉 100 个（50 leaky、5 scale、45 残差 add）。如实说明差距：ONNX Runtime CPU EP 同模型 5 155 ms——ggml CPU 卷积路径目前落后约 5.4×（ORT 级别的线程化/分块优化是进行中的工作；本段旧版写的 4 764 ms 与 ORT 持平记录于陈旧构建，已更正）。单线程内层循环的指针递增教训依然成立：距线程扩展后峰值的剩余差距来自 FMA 关键路径上的广播 load-to-use 延迟（寄存器驻留对照变体能跑到 2 FMA/cycle 标定线），而非内存带宽。
 
@@ -181,7 +181,7 @@ struct ggml_tensor * ggml_conv_direct_1d_fused(  // + 残差、输入侧折入
 | `REL_POS_BIAS` | ✅ | ✅ | —（回落 CPU） | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅（add 需原子扩展） | — | — |
 | `ADD_LEAKY_RELU` | ✅ | —（回落 CPU） | — | — |
-| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | ✅ 补丁四（fp32，`K ≥ 3`，`(K−1)·dil ≤ 72`，否则回落 CPU） | — | — |
+| `CONV_DIRECT_1D`（含 `_fused`） | ✅ | ✅ 补丁四（fp32，`K ≥ 3`，`(K−1)·dil ≤ 72`，否则回落 CPU） | — | ✅ 补丁六（F32，Apple7） |
 
 ## 上游跟进建议
 

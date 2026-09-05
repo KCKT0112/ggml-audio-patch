@@ -169,7 +169,7 @@ struct ggml_tensor * ggml_conv_direct_1d_fused(  // + residual, input-side fold
 - **Phase 1** packs `Wᵀ` into a `[IC·K, OCp]` blocked layout (`OCp` = OC rounded up to 16), zero-pads the bias to `[OCp]`, and copies `x` into an `[IC, T+2·pad]` scratch with both boundary pads `memset` to zero — phase 2 carries no boundary clamping at all. The producer-side input fold happens here, once per element.
 - **Phase 2** hands each thread a balanced range of 6-wide t-blocks. Superblocks (oc-super × t-super, sized for an X slice ≤ 64 KB and a Wt slice ≤ 128 KB) keep both operands L2/L3-resident so X and Wt stream from RAM roughly once per call. The AVX2 micro-kernel is a 6×16 tile (12 FMAs + 6 broadcasts per `(ic, kw)` step) with **pointer-increment addressing**: the naive `imul`-on-loop-counter address chain (`inc → movsxd → imul`, ≈5 serial cycles per tap) was measured to gate broadcast dispatch below 1 FMA/cycle; incrementing `xp += dil, wp += OCp` instead raised the single-thread rate from 24.6 to 31.8 GF/s (+26%) on a Xeon E5-2675 v3. A scalar path handles the tail t-block and non-AVX2 builds.
 
-**Backends**: CPU only by design — on Vulkan the GEMM is strong and the im2col path stays; other backends reject the op in `supports_op` → CPU fallback.
+**Backends**: CPU (patch 1), Vulkan (patch 4), and Metal (patch 6), with the device/shape restrictions below. Metal uses F32 implicit GEMM and preserves input `leaky(x * in_scale)` and output fusion order; cross-backend accumulation is not promised bit-identical. See [Metal direct convolution](metal-direct-conv.md) for integration and tests.
 
 **Measured** (Xeon E5-2675 v3, 16C/32T Haswell-EP, ~2.0 GHz sustained AVX2, MSVC 2019 `/O2`, fp32, 24 threads, median of 3; harness pc-nsf-hifigan.cpp @ `f8c16ba`): full NSF-HiFiGAN inference 80 002 ms (stock im2col + `mul_mat`) → **28 030 ms** (direct + producer-side fusions), **2.85×**, at corr 0.99999999 / max|Δ| 1.49e-4 vs the torch-CPU fp32 output — the same accuracy as the im2col path (FMA-ordering noise only). The fusions removed 100 of 252 graph nodes (50 leaky, 5 scale, 45 residual add). Honest gap: ONNX Runtime CPU EP runs the same model in 5 155 ms — the ggml CPU conv path is ~5.4× behind it today (ORT-level threading/blocking is the active workstream; a previous revision of this note quoting 4 764 ms at ORT parity was recorded against a stale build and has been corrected). On the single-thread inner loop the pointer-increment lesson still stands: the residual gap to the thread-scaled rate is broadcast load-to-use latency on the FMA critical path (a register-resident control variant reaches the 2-FMA/cycle calibration line), not memory bandwidth.
 
@@ -182,7 +182,7 @@ struct ggml_tensor * ggml_conv_direct_1d_fused(  // + residual, input-side fold
 | `REL_POS_BIAS` | ✅ | ✅ | — (CPU fallback) | — |
 | `SCATTER_ELEMENTS` | ✅ | ✅ (add needs the atomic ext) | — | — |
 | `ADD_LEAKY_RELU` | ✅ | — (CPU fallback) | — | — |
-| `CONV_DIRECT_1D` (+`_fused`) | ✅ | ✅ patch 4 (fp32, `K ≥ 3`, `(K−1)·dil ≤ 72`; else CPU fallback) | — | — |
+| `CONV_DIRECT_1D` (+`_fused`) | ✅ | ✅ patch 4 (fp32, `K ≥ 3`, `(K−1)·dil ≤ 72`; else CPU fallback) | — | ✅ patch 6 (F32, Apple7) |
 
 ## Upstream follow-up suggestions
 

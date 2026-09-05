@@ -2,6 +2,8 @@
 
 > English | **[中文](metal-porting_zh.md)**
 
+Patch 6 adds HiFiGAN F32 direct convolution and the missing `IM2COL_FAST_1D` capability alias. See [Metal direct convolution](metal-direct-conv.md) for application order, 29 direct-convolution tests, Apple7 gating and historical performance. The original patch-3 validation record remains below.
+
 What the optional patch 3 (`patches/metal-ops-ggml0190.patch`) wires into
 Apple's Metal backend, how to run its test harness, the pitfalls to know
 when maintaining it, and the verified delivery. Editing boundaries for
