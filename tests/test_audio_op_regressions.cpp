@@ -121,6 +121,9 @@ static void direct_strides(ggml_backend_t backend, bool strided) {
     const int K=3, IC=2, OC=17, T=7;
     auto storage=ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, strided ? OC : K, strided ? K : IC, strided ? IC : OC);
     auto w=strided ? ggml_permute(g.ctx, storage,2,0,1,3) : storage;
+    // ggml assigns result->ne[axis_i] = input->ne[i]. For [OC,K,IC],
+    // (2,0,1,3) therefore produces [K,IC,OC], not (1,2,0,3).
+    require(w->ne[0] == K && w->ne[1] == IC && w->ne[2] == OC, "permuted weight shape mismatch");
     auto bias_storage=ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, 2*OC);
     auto bias=strided ? ggml_transpose(g.ctx,ggml_view_2d(g.ctx,bias_storage,1,OC,8,0))
                       : ggml_view_1d(g.ctx,bias_storage,OC,0);
